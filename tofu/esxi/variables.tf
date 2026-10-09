@@ -27,8 +27,8 @@ variable "esxi_datastore" {
   default     = "datastore1"
   description = "Datastore of the base disks and of the VMs (spaces allowed, as in \"datastore1 (1)\")"
   validation {
-    condition     = length(var.esxi_datastore) > 0 && !can(regex("['/]", var.esxi_datastore))
-    error_message = "esxi_datastore must be a datastore name without quotes or slashes."
+    condition     = length(var.esxi_datastore) > 0 && !can(regex("['/]", var.esxi_datastore)) && !contains([".", ".."], var.esxi_datastore)
+    error_message = "esxi_datastore must be a datastore name without quotes or slashes (not . or ..)."
   }
 }
 

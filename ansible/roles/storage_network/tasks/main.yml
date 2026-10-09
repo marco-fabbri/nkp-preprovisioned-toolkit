@@ -1,6 +1,7 @@
 ---
 # ==============================================================================
-# Role: storage_network - MetalLB Ingress Pool & Ceph Loop Devices on Workers
+# Role: storage_network - MetalLB Ingress Pool & Ceph OSD device on Workers
+#       (raw disk by default, loop device as lab shortcut)
 # ==============================================================================
 
 - name: Generate manifest for MetalLB IP pool

@@ -50,6 +50,9 @@ jobs:
       - name: Conditions are strings
         run: python .github/scripts/check_conditionals.py
 
+      - name: Cluster UUID source
+        run: .github/scripts/check_cluster_uuid_source.sh
+
       # ansible-lint follows include_tasks and roles, so a broken task file
       # fails here even though --syntax-check alone would not notice it.
       - name: ansible-lint

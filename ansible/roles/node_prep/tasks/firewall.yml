@@ -2,8 +2,8 @@
 # ==============================================================================
 # Role: node_prep - Host firewall rules for Kubernetes (firewalld / UFW)
 # ==============================================================================
-# The NKP guide lists "firewalld disabled" among the prerequisites of
-# pre-provisioned machines. This file never enables a firewall by itself and
+# The NKP guide requires firewalld disabled on the hosts, among the
+# prerequisites of pre-provisioned machines. This file never enables a firewall by itself and
 # never stops one: when a firewall is already active on a node it adds the rules
 # the cluster needs and prints a notice, because that setup is outside the
 # vendor prerequisites. It can be reused from other playbooks with include_role

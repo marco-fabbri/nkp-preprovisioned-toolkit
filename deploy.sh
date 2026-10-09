@@ -82,7 +82,8 @@ case "$command_arg" in
     ;;
   tofu-init|tofu-plan|tofu-apply|tofu-destroy)
     # OpenTofu needs neither inventory.ini nor Ansible; inventory.ini, when
-    # present, only supplies the OS and the optional tofu_sizing_profile.
+    # present, only supplies tofu_provider, the OS (from os_profile) and the
+    # optional tofu_sizing_profile.
     command -v tofu >/dev/null 2>&1 || { echo "tofu not found. Install OpenTofu on this computer (see tofu/README.md)." >&2; exit 127; }
     provider="${TOFU_PROVIDER:-$(inventory_var tofu_provider)}"
     provider="${provider:-proxmox}"

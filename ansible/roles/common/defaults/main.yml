@@ -31,7 +31,7 @@ vm_default_password_salt: "{{ (inventory_hostname | hash('sha256'))[:16] }}"
 # "PasswordAuthentication yes" (true) or "PasswordAuthentication no" (false).
 ssh_password_authentication: true
 
-# Host firewall on cluster nodes. The NKP guide lists "firewalld disabled" as a
+# Host firewall on cluster nodes. The NKP guide requires firewalld disabled as a
 # prerequisite of pre-provisioned machines, so the toolkit never enables a
 # firewall on a node unless asked to (see README.md, "Host firewalls"):
 #   cis_firewalld_on_nodes  -cis profiles, Rocky: install and enable firewalld

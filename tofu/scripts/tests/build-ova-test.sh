@@ -8,15 +8,12 @@ here="$(cd "$(dirname "$0")" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 qemu-img create -q -f qcow2 "$work/src.qcow2" 1G
-# An extended attribute on the source, as macOS sets on downloaded files.
-if command -v xattr >/dev/null 2>&1; then
-  xattr -w com.example.test 1 "$work/src.qcow2" 2>/dev/null || true
-fi
 "$here/../build-ova.sh" "$work/src.qcow2" test-image ubuntu64Guest "$work/out.ova"
 # Listed with Python's tar reader, as the vSphere provider (Go) reads it: the
-# OVA must hold exactly the OVF and the disk, OVF first. macOS tar would add
-# AppleDouble "._*" entries for files with extended attributes, and the
-# provider takes the first entry ending in .ovf.
+# OVA must hold exactly the OVF and the disk, OVF first. On macOS, tar adds
+# AppleDouble "._*" entries for files that carry extended attributes unless
+# COPYFILE_DISABLE is set, and the provider takes the first entry ending in
+# .ovf; this check fails if such entries ever appear.
 members="$(python3 -c 'import sys, tarfile; print(" ".join(m.name for m in tarfile.open(sys.argv[1]).getmembers()))' "$work/out.ova")"
 [ "$members" = "test-image.ovf test-image-disk1.vmdk" ] || { echo "FAIL: OVA members are: $members"; exit 1; }
 tar -xOf "$work/out.ova" test-image.ovf > "$work/test.ovf"

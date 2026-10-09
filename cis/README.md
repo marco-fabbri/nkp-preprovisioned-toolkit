@@ -13,7 +13,8 @@ Kubernetes needs a different value.
 >   benchmark tool such as CIS-CAT or OpenSCAP.
 > - The audit checks only the controls listed below, nothing else.
 > - This project is not affiliated with, endorsed by or supported by the Center for
->   Internet Security (CIS) or Nutanix.
+>   Internet Security (CIS) or Nutanix. CIS and CIS Benchmarks are trademarks of the
+>   Center for Internet Security, Inc.; no CIS Benchmark document is distributed here.
 
 ---
 
@@ -28,13 +29,13 @@ row numbers of the audit report.
 |---|---|---|---|
 | 1 | Unused filesystem kernel modules | `install <module> /bin/false` and `blacklist <module>` for `cramfs`, `freevxfs`, `hfs`, `hfsplus`, `jffs2`, `udf` in `/etc/modprobe.d/60-cis-filesystems.conf` | `modprobe --showconfig` contains both lines for every module |
 | 2 | Kernel parameters | `kernel.randomize_va_space=2`, `fs.suid_dumpable=0`, `tcp_syncookies=1`, `icmp_echo_ignore_broadcasts=1`, and for `all`/`default`: `send_redirects=0`, `accept_source_route=0`, `accept_redirects=0`, `secure_redirects=0`, `log_martians=1` (`/etc/sysctl.d/60-cis.conf`). Ubuntu: apport is disabled and `/etc/ufw/sysctl.conf` is aligned, because both would reset some of these values | Running values read with `sysctl` |
-| 3 | Auditing, time sync and cron | Packages installed, services enabled and started: auditd, chrony, cron (`crond` on Rocky) | `systemctl is-active` for the three services |
+| 3 | Auditing, time sync and cron | Packages installed, services enabled and started: auditd, chrony (`chronyd` on Rocky), cron (`cronie` package and `crond` service on Rocky) | `systemctl is-active` for the three services |
 | 4 | auditd rules | `/etc/audit/rules.d/50-cis.rules`: time changes, identity files, network environment files, sudoers, kernel module loading (syscall rules for `b64` and `b32`) | `auditctl -l` contains rules with the keys `time-change`, `identity`, `system-locale`, `scope`, `modules` |
 | 5 | File permissions | `/etc/passwd`, `/etc/group` 0644 root:root; `/etc/shadow`, `/etc/gshadow` 0000 root:root on Rocky and 0640 root:shadow on Ubuntu; `/etc/crontab` 0600; `/etc/cron.{hourly,daily,weekly,monthly,d}` 0700 | Mode, owner and group of every path |
 | 6 | Account and password defaults | `umask 027` for login shells (`/etc/profile.d/60-cis-umask.sh`); `INACTIVE=30` for accounts created later (`useradd -D`); `/etc/security/pwquality.conf` with `minlen = 14` and one character of each class | The three settings |
 | 7 | Login warning banners | `/etc/issue`, `/etc/issue.net`, `/etc/motd` with a warning text, 0644 root:root | Files present, not empty, 0644, owned by root, without OS information escapes (`\m \r \s \v`) |
 | 8 | OpenSSH daemon | `/etc/ssh/sshd_config.d/00-cis.conf`: `LogLevel INFO`, `MaxAuthTries 4`, `IgnoreRhosts yes`, `HostbasedAuthentication no`, `PermitEmptyPasswords no`, `PermitRootLogin no`, `ClientAliveInterval 300`, `ClientAliveCountMax 3`, `LoginGraceTime 60`, `X11Forwarding no`, `Banner /etc/issue.net`. Validated with `sshd -t` before sshd is restarted | Effective values from `sshd -T` |
-| 9 | Host firewall | **Not applied on cluster nodes unless you opt in** (see [Host firewall on cluster nodes](#host-firewall-on-cluster-nodes)). Where it is applied: firewalld (Rocky, default `public` zone, whose other default services are not removed) or UFW (Ubuntu, incoming policy `deny`) enabled, SSH allowed on the port Ansible uses. The rules are written before the firewall is started | Rocky: `firewall-cmd --state`, SSH service and port, trusted sources, masquerading. Ubuntu: `ufw status verbose` (`Status: active`, default policies, SSH rule, trusted sources). Where it is not applied: `NOT APPLIED (by design ...)` plus the observed firewall state, never FAIL |
+| 9 | Host firewall | **Not applied on cluster nodes unless you opt in** (see [Host firewall on cluster nodes](#host-firewall-on-cluster-nodes)). Where it is applied: firewalld (Rocky, default `public` zone; the services it allows out of the box besides SSH, `cockpit` and `dhcpv6-client` (`cis_firewalld_default_services_to_remove`), are removed) or UFW (Ubuntu, incoming policy `deny`) enabled, SSH allowed on the port Ansible uses. The rules are written before the firewall is started | Rocky: `firewall-cmd --state`, SSH service and port, trusted sources, masquerading. Ubuntu: `ufw status verbose` (`Status: active`, default policies, SSH rule, trusted sources). Where it is not applied: `NOT APPLIED (by design ...)` plus the observed firewall state, never FAIL |
 
 The audit prints one PASS/FAIL line per control for every host; a FAIL line names
 the items that do not match. The play **fails** (non-zero exit code) for every host

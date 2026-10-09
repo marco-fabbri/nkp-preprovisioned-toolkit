@@ -27,8 +27,8 @@
 # prescribes host storage mode instead: Ceph takes the node devices matching
 # a filter (ceph_device_filter for a kernel name, ceph_device_path_filter for an
 # absolute path, see role "common"). Rook never selects a loop device through a
-# filter, so the lab
-# shortcut names the device explicitly. Only workers are checked for the
+# filter, so the lab shortcut names the device explicitly. Only workers are
+# checked for the
 # device, so the OSD placement keeps Rook off the control plane nodes.
 - name: Generate the default Kommander installer configuration
   ansible.builtin.command:
@@ -141,20 +141,21 @@
 
 # ------------------------------------------------------------------------------
 # License: never applied or changed by this toolkit. The licence is bound to the
-# Cluster UUID, the UID of the kube-system namespace, which exists only once
-# the cluster is created: the summary prints it with the activation steps.
+# Cluster UUID, the UID of the Cluster API "Cluster" object the NKP CLI
+# created (the identifier the Nutanix licensing KB asks for), which exists only
+# once the cluster is created: the summary prints it with the activation steps.
 # ------------------------------------------------------------------------------
-- name: Read the Cluster UUID (UID of the kube-system namespace)
+- name: Read the Cluster UUID (UID of the Cluster API cluster object)
   ansible.builtin.command:
     argv:
       - kubectl
       - --kubeconfig
       - "{{ cluster_kubeconfig }}"
       - get
-      - namespace
-      - kube-system
+      - clusters.cluster.x-k8s.io
+      - --all-namespaces
       - -o
-      - jsonpath={.metadata.uid}
+      - jsonpath={.items[0].metadata.uid}
   become: false
   register: kommander_deploy_cluster_uuid
   changed_when: false
@@ -250,9 +251,15 @@
   changed_when: false
   failed_when: false
 
-- name: Print cluster access details and summary banner
-  ansible.builtin.debug:
-    msg: "{{ banner_access + banner_license }}"
+# The License resource never carries the licence id, even once a licence is
+# activated: the tier tells the two states apart. Pro is the default key NKP
+# assigns on non-Nutanix infrastructure; any other valid tier was activated.
+- name: Compose the summary banner
+  ansible.builtin.set_fact:
+    kommander_deploy_banner_access: "{{ banner_access }}"
+    kommander_deploy_banner_license_activated: "{{ banner_license_activated | bool }}"
+    kommander_deploy_banner_license_activated_lines: "{{ banner_license_activated_lines }}"
+    kommander_deploy_banner_license_default_lines: "{{ banner_license_default_lines }}"
   vars:
     banner_rule: "=============================================================================="
     banner_sep: "------------------------------------------------------------------------------"
@@ -272,7 +279,8 @@
     banner_cluster_uuid: >-
       {{ kommander_deploy_cluster_uuid.stdout | trim
          if (kommander_deploy_cluster_uuid.rc | default(1)) == 0 and kommander_deploy_cluster_uuid.stdout | trim | length > 0
-         else 'unknown (run on the jump host: kubectl --kubeconfig ' ~ cluster_kubeconfig ~ ' get namespace kube-system -o jsonpath={.metadata.uid})' }}
+         else 'unknown (run on the jump host: kubectl --kubeconfig ' ~ cluster_kubeconfig
+              ~ ' get clusters.cluster.x-k8s.io -A -o jsonpath={.items[0].metadata.uid})' }}
     banner_license_status: >-
       {{
         'unknown (the license query failed)'
@@ -300,10 +308,30 @@
       - "Application status (run on the jump host): kubectl --kubeconfig {{ cluster_kubeconfig }} -n kommander get helmreleases"
       - "Kubeconfig on the jump host: {{ cluster_kubeconfig }}"
       - "{{ banner_sep }}"
-    banner_license:
+    # Split rather than regex_search: on a non-match, regex_search with a
+    # capture group raises on some ansible-core versions instead of returning
+    # nothing.
+    banner_license_tier: >-
+      {{ ((kommander_deploy_license_status_out.stdout | default('', true)) ~ ' ')
+         | regex_replace('^.*?tier=', '') | split(' ') | first
+         if 'tier=' in (kommander_deploy_license_status_out.stdout | default('', true)) else '' }}
+    banner_license_activated: >-
+      {{ (kommander_deploy_license_status_out.rc | default(1)) == 0
+         and banner_license_tier | length > 0 and banner_license_tier != 'Pro'
+         and 'valid=true' in (kommander_deploy_license_status_out.stdout | default('', true)) }}
+    banner_license_activated_lines:
       - "NKP LICENSE"
       - "{{ banner_sep }}"
-      - "Cluster UUID (UID of the kube-system namespace): {{ banner_cluster_uuid }}"
+      - "Cluster UUID (UID of the Cluster API cluster object): {{ banner_cluster_uuid }}"
+      - "License status reported by the cluster: {{ banner_license_status }}"
+      - "{{ 'An' if banner_license_tier is match('^[AEIOUaeiou]') else 'A' }} {{ banner_license_tier }} licence is activated on this cluster"
+      - "(the dashboard shows its expiry and core usage under Global > Settings > Licensing)."
+      - "This toolkit never applies or changes the licence."
+      - "{{ banner_rule }}"
+    banner_license_default_lines:
+      - "NKP LICENSE"
+      - "{{ banner_sep }}"
+      - "Cluster UUID (UID of the Cluster API cluster object): {{ banner_cluster_uuid }}"
       - "License status reported by the cluster: {{ banner_license_status }}"
       - "Until a licence is activated the cluster runs on the default key NKP assigns (tier Pro, no license id,"
       - "zero capacity) and the dashboard reports that no license is activated. To activate yours:"
@@ -311,3 +339,13 @@
       - "  2. in the NKP dashboard select Global > Settings > Licensing > Activate License and enter the key."
       - "This toolkit never applies or changes the licence."
       - "{{ banner_rule }}"
+
+- name: Print cluster access details and summary banner (licence activated)
+  ansible.builtin.debug:
+    msg: "{{ kommander_deploy_banner_access + kommander_deploy_banner_license_activated_lines }}"
+  when: kommander_deploy_banner_license_activated | bool
+
+- name: Print cluster access details and summary banner (default licence key)
+  ansible.builtin.debug:
+    msg: "{{ kommander_deploy_banner_access + kommander_deploy_banner_license_default_lines }}"
+  when: not (kommander_deploy_banner_license_activated | bool)

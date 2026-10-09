@@ -16,12 +16,16 @@ The validation status of the current revision is stated in
   failed it (`rocky-cis`, `ubuntu-cis`). The host firewall control is not applied on
   cluster nodes unless opted in (NKP prerequisite).
 - Worker scale-out and scale-in through Cluster API (`PreprovisionedInventory` plus
-  `MachineDeployment` scaling).
+  `MachineDeployment` scaling). Validated in the lab on every OS profile: remove then
+  re-add the same worker, with the Ceph OSD purged and recreated.
 - Preflight checks for address overlap with the Pod and Service CIDRs, sizing, OS,
   worker data disks, VIP and API port.
 - Worker disk layout of the NKP guide by default: a raw disk for the Rook Ceph OSD
   (`ceph_osd_device`) and one disk per local volume (`local_volume_devices`); the
   loop device and bind-mounted directory shortcuts remain as opt-ins.
+- Licence activation flow: the installation summary prints the Cluster UUID the
+  licence is issued for (the Cluster API cluster object) and reads the activated
+  tier back from the cluster; validated in the lab with an NKP Ultimate key.
 - OpenTofu provisioning modules under `tofu/<provider>/` with one contract and a
   shared layout module: Proxmox, Nutanix AHV, standalone ESXi (free licence
   included) and vSphere, plus the contract test `./deploy.sh tofu-verify`.
@@ -30,7 +34,6 @@ The validation status of the current revision is stated in
 
 | ID | Item | Notes |
 |---|---|---|
-| BL-04 | Lab validation of Day-2 scaling on both operating systems | Remove then re-add the same host; behaviour of the preprovisioned provider on Machine deletion |
 | BL-05 | Node-only preflight entry point for `add-worker` | Today the whole preflight role runs, so `downloads/nkp` and its checksums are still required at Day-2 |
 | BL-06 | Run the CIS audit on a worker added on a `-cis` profile | The baseline is applied; the audit must be run by hand |
 | BL-07 | Single source for the node firewall rules | `node_prep` and the CIS tasks use the same variables but separate task files |
@@ -40,7 +43,6 @@ The validation status of the current revision is stated in
 | BL-13 | SSH port other than 22 for Cluster API | The host firewall rules follow `ansible_port`; the `PreprovisionedInventory` still uses port 22 |
 | BL-14 | Automated rollback of a failed `add-worker` | Today the failure message prints the manual `kubectl` steps |
 | BL-17 | NKP installation on VMs created by `tofu/nutanix`, `tofu/esxi` and `tofu/vsphere` | Validated with `./deploy.sh tofu-verify` only |
-| BL-19 | Lab check of the licence summary after an activation in the dashboard | The toolkit only reads the licence: after activating a real Pro or Ultimate key, re-run `./deploy.sh install --tags kommander_deploy` and check that the status line reports the licence id and capacity |
 | BL-18 | Remove the directory shortcut data at `remove-worker` cleanup | With `local_volume_devices = []` the directories `/var/local-disks/volN` and their bind mounts are left on the host |
 
 ## Out of scope

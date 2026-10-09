@@ -9,7 +9,11 @@ nutanix_password = "secret"
 
 # --- Placement --------------------------------------------------------------------
 nutanix_cluster_name = "cluster01"
-nutanix_subnet_name  = "vlan10" # static addresses through cloud-init: no IPAM needed
+nutanix_subnet_name  = "vlan10" # AHV subnet of the nodes; addresses are static (cloud-init)
+# With AHV IPAM on that subnet, also reserve each VM address on AHV; the VM
+# addresses must then lie inside one of the subnet's IP pools (keep the VIP and
+# the MetalLB range outside them).
+# nutanix_subnet_ipam = true
 # nutanix_storage_container_name = "default-container"
 
 # --- VM layout ----------------------------------------------------------------

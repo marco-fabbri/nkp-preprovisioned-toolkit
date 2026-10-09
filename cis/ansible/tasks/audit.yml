@@ -82,7 +82,7 @@
 # Return code 1 means that no banner discloses OS details through \m \r \s \v.
 - name: Audit 7 - Search the login banners for OS information
   ansible.builtin.command:
-    cmd: grep -E '\\[mrsv]' /etc/issue /etc/issue.net
+    argv: "{{ ['grep', '-E', '\\\\[mrsv]'] + cis_banner_files }}"
   register: cis_audit_banner_escapes
   changed_when: false
   failed_when: false

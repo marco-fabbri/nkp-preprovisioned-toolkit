@@ -129,3 +129,30 @@ run "rejects_a_quote_in_the_datastore_name" {
   }
   expect_failures = [var.esxi_datastore]
 }
+
+run "rejects_a_dot_datastore" {
+  command = plan
+  variables {
+    esxi_datastore = "."
+  }
+  expect_failures = [var.esxi_datastore]
+}
+
+run "rejects_a_dotdot_datastore" {
+  command = plan
+  variables {
+    esxi_datastore = ".."
+  }
+  expect_failures = [var.esxi_datastore]
+}
+
+run "accepts_a_datastore_name_with_spaces" {
+  command = plan
+  variables {
+    esxi_datastore = "datastore1 (1)"
+  }
+  assert {
+    condition     = terraform_data.vm["nkp-cp-01"].input.vm_dir == "/vmfs/volumes/datastore1 (1)/nkp/nkp-cp-01"
+    error_message = "a datastore name with spaces must be accepted"
+  }
+}

@@ -1,8 +1,8 @@
 # Provider independent layout: sizes, names, cloud-init documents and the
 # inventory snippet. No resources and no providers.
 
-# pro-ultimate follows the "General Resource Requirements for Pro and Ultimate
-# Clusters" table of the NKP 2.18 guide, the licences pre-provisioned
+# pro-ultimate follows the general resource requirements that the NKP 2.18
+# guide sets for Pro and Ultimate clusters, the licences pre-provisioned
 # infrastructure requires. The local volume disks get 110 GB because
 # Prometheus claims exactly 100 GiB and the file system is a little smaller
 # than the disk. contract-test is far below the NKP minimums: it only exists to

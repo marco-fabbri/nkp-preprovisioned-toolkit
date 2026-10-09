@@ -54,8 +54,8 @@ value per disk role and Rook Ceph gets a single filter:
 | `esxi` | `/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0` | SCSI unit of the PVSCSI controller |
 | `vsphere` | `/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0` | SCSI unit of the PVSCSI controller |
 
-AHV and vSphere do not let a module choose the serial of a virtual disk, so
-their modules use the `by-path` link, which encodes the controller and the
+AHV, ESXi and vSphere do not let a module choose the serial of a virtual disk,
+so their modules use the `by-path` link, which encodes the controller and the
 slot and is identical on VMs with the same virtual hardware. The paths were
 read on test VMs of both images and are the defaults of `guest_ceph_device`
 and `guest_local_volume_devices`; `./deploy.sh tofu-verify` fails if they do
@@ -121,8 +121,11 @@ The common inputs are checked before anything is created: every address must
 be IPv4, the VM addresses must all differ, `control_plane_vip` must not be a
 VM address, the prefix length must lie between 8 and 30.
 
-Provider-specific inputs carry the provider prefix (`proxmox_`, `nutanix_`,
-`esxi_`, `vsphere_`) or, for the names the guest sees, `guest_`. They are
+Provider-specific inputs carry the provider prefix (`nutanix_`, `esxi_`,
+`vsphere_`; on Proxmox only the connection inputs do, the placement ones such as
+`datastore_id`, `network_bridge` and `vm_id_base` are unprefixed) or, for the
+names the guest sees, `guest_` (Nutanix, ESXi, vSphere). The cloud image URLs
+are `rocky9_image_url` and `ubuntu24_image_url` in every module. They are
 documented in each module's `variables.tf` and `terraform.tfvars.example`.
 
 Outputs: `jump_host_ip`, `control_plane_ips`, `control_plane_vip`, `worker_ips`
@@ -143,8 +146,10 @@ Changing `os_distribution` rebuilds the VMs (`terraform_data.os_image` with
 updating them in place with the old system disk. So does a change to the
 cloud-init documents of a VM (address, gateway, DNS, key) on `nutanix`,
 `esxi` and `vsphere`: cloud-init only applies them to a new instance, and
-Prism Central does not even return them. The cloud images are cached and
-named after their URL, so a new image URL gives a new image. Resource names
+Prism Central does not even return them. On `esxi` and `vsphere` the cloud
+images are cached on this computer and named after their URL, so a new image
+URL gives a new image (Proxmox and Prism Central download the image themselves
+under a fixed name). Resource names
 are part of the contract so that an existing state keeps working across
 toolkit versions.
 
@@ -222,7 +227,7 @@ module and the only command meant for `contract-test` VMs. It installs no
 package and changes nothing persistent on the hosts. It checks:
 
 - SSH and sudo access with `ansible_user` on every host, and the toolkit
-  preflight with the vCPU, RAM and root disk checks skipped (a warning reminds
+  preflight with the vCPU, RAM and disk size thresholds skipped (a warning reminds
   that NKP must not be installed on undersized hosts);
 - on every worker: `ceph_osd_device` and every entry of
   `local_volume_devices` resolve to a whole disk, each to a different one and
@@ -301,8 +306,9 @@ What it does **not** validate:
 ## Nutanix AHV notes
 
 - Prism Central is required (the v2 resources use the v4 APIs, stable from
-  pc.2024.3); Prism Element alone is not enough. The user needs to create
-  images and VMs on the target cluster.
+  pc.2024.3); Prism Element alone is not enough. The Prism Central user
+  (`nutanix_username`) must be allowed to create images and VMs on the target
+  cluster.
 - Prism Central downloads the cloud images from `rocky9_image_url` and
   `ubuntu24_image_url`: the URLs must be reachable from Prism Central.
 - cloud-init arrives through the AHV guest customization (ConfigDrive), which

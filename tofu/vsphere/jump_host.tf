@@ -15,7 +15,8 @@ resource "vsphere_virtual_machine" "jump_host" {
   guest_id         = local.guest_id
   scsi_type        = "pvscsi"
   enable_disk_uuid = true
-  # The cloud images carry no VMware Tools: do not wait for a guest IP.
+  # The Rocky GenericCloud image ships no VMware Tools (Ubuntu ships
+  # open-vm-tools): do not wait for a guest IP on either.
   wait_for_guest_net_timeout = 0
   wait_for_guest_ip_timeout  = 0
 

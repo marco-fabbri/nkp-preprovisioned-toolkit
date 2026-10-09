@@ -300,8 +300,8 @@ The kernel names of these disks do not follow the slot order (see
 [Worker disks](#worker-disks)): the generated inventory names them by a stable
 link that reads the same on every worker. On Proxmox it is the serial the module
 sets (`/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-ceph`, `..._nkp-vol1` to
-`..._nkp-vol4`); AHV and vSphere do not let a module choose a disk serial, so their
-modules use the `/dev/disk/by-path` link of the SCSI slot. The values per provider
+`..._nkp-vol4`); AHV, ESXi and vSphere do not let a module choose a disk serial, so
+their modules use the `/dev/disk/by-path` link of the SCSI slot. The values per provider
 are in [tofu/README.md](tofu/README.md#stable-disk-paths).
 
 The outputs are the addresses and `ansible_inventory`, an `inventory.ini` snippet with
@@ -379,9 +379,11 @@ on the hosts; the NKP CLI is not needed. It checks:
 - the layer-2 path of the VIP: `control_plane_vip/32` is added to
   `virtual_ip_interface` of the first control plane node, pinged three times from a
   worker and always removed again. A failure names the virtual switch settings that
-  block kube-vip and MetalLB. The test is skipped when a cluster already owns the
-  VIP, which the preflight assumes when `<cluster_name>.conf` is in the repository
-  root: remove that kubeconfig when the hosts were rebuilt.
+  block kube-vip and MetalLB. The test is skipped when the preflight treats the
+  cluster as existing: a non-empty `<cluster_name>.conf` in the repository root
+  or `~/nkp/<cluster_name>.conf` on the jump host, or
+  `preflight_assume_existing_cluster=true`. Remove those kubeconfigs when the
+  hosts were rebuilt.
 
 It ends with a summary and exits non-zero when any host failed. It does **not**
 validate the NKP size requirements (that is `./deploy.sh check` without
@@ -438,7 +440,11 @@ running `install` again:
    clear the Ceph device, which otherwise carries the signature of the previous
    cluster and is silently skipped by Rook (Stage 4 refuses it): raw disk,
    `wipefs --all <disk>` (`ceph_osd_device`, or `/dev/` followed by it for a kernel
-   name; check with `lsblk` that it is the right disk); loop device,
+   name; check with `lsblk` that it is the right disk), then zero the BlueStore
+   label copies that Ceph 19 keeps at 0, 1, 10, 100 and 1000 GiB, which `wipefs`
+   does not remove (`for off in 0 1024 10240 102400 1024000; do dd if=/dev/zero
+   of=<disk> bs=1M count=1 seek=$off oflag=direct conv=notrunc; done`, each
+   offset only if it fits on the disk); loop device,
    `systemctl disable --now attach-ceph-loop && losetup -d /dev/loop100 && rm /var/lib/ceph-osd.img`;
    in both cases `rm -rf /var/lib/rook`. The local volume disks keep their file
    systems and are reused as they are: delete their content under `/mnt/disks/volN`
@@ -571,11 +577,14 @@ This toolkit does not include, generate, apply or change any NKP licence.
   states that this default key must be replaced with the one from the Nutanix
   Support Portal, and that the Starter licence is supported only on Nutanix
   infrastructure: pre-provisioned clusters need Pro or Ultimate.)
-- An NKP licence is issued for a **Cluster UUID**, the UID of the `kube-system`
-  namespace, which exists only once the cluster has been created. The installation
-  therefore prints it in its summary (see [After the installation](#after-the-installation));
-  on the jump host you can read it at any time with
-  `kubectl --kubeconfig ~/nkp/<cluster_name>.conf get namespace kube-system -o jsonpath='{.metadata.uid}'`.
+- An NKP licence is issued for a **Cluster UUID**: the UID of the Cluster API
+  `Cluster` object the NKP CLI creates (the identifier the Nutanix licensing
+  knowledge base asks for), which exists only once the cluster has been created.
+  The installation therefore prints it in its summary (see
+  [After the installation](#after-the-installation)); on the jump host you can
+  read it at any time with
+  `kubectl --kubeconfig ~/nkp/<cluster_name>.conf get cluster -o jsonpath='{.items[0].metadata.uid}'`.
+  It is not the UID of the `kube-system` namespace, which NKP uses for monitoring.
 - To activate it: request an NKP Pro or Ultimate licence for that Cluster UUID on the
   Nutanix Support Portal, then in the NKP dashboard select **Global > Settings >
   Licensing > Activate License** and enter the key.
@@ -606,7 +615,7 @@ Kubeconfig on the jump host: /home/nutanix/nkp/nkp-cluster.conf
 ------------------------------------------------------------------------------
 NKP LICENSE
 ------------------------------------------------------------------------------
-Cluster UUID (UID of the kube-system namespace): 0f2a6c1e-8d4b-4c3a-9b7e-5a1d2c3e4f50
+Cluster UUID (UID of the Cluster API cluster object): 0f2a6c1e-8d4b-4c3a-9b7e-5a1d2c3e4f50
 License status reported by the cluster: nutanix-license: tier=Pro valid=true licenseId= clusters=0 cores=0
 Until a licence is activated the cluster runs on the default key NKP assigns (tier Pro, no license id,
 zero capacity) and the dashboard reports that no license is activated. To activate yours:
@@ -617,8 +626,23 @@ This toolkit never applies or changes the licence.
 ```
 
 Once a licence is activated in the dashboard, running
-`./deploy.sh install --tags kommander_deploy` again reprints the summary with the
-licence id and capacity in the status line.
+`./deploy.sh install --tags kommander_deploy` again reprints the block as:
+
+```text
+NKP LICENSE
+------------------------------------------------------------------------------
+Cluster UUID (UID of the Cluster API cluster object): 0f2a6c1e-8d4b-4c3a-9b7e-5a1d2c3e4f50
+License status reported by the cluster: nutanix-license: tier=Ultimate valid=true licenseId= clusters=0 cores=0
+An Ultimate licence is activated on this cluster
+(the dashboard shows its expiry and core usage under Global > Settings > Licensing).
+This toolkit never applies or changes the licence.
+==============================================================================
+```
+
+The toolkit tells the two states apart by the tier: `Pro` is the key NKP assigns by
+default on non-Nutanix infrastructure, any other valid tier was activated. The
+`License` resource does not report the licence id, expiry or core usage; the
+dashboard does.
 
 Variants:
 
@@ -765,7 +789,9 @@ After a timeout:
    resolved on the host as in the preflight; a value that resolves to no disk, to
    the same disk as another value or to the disk holding `/` stops the clean-up
    before anything is changed. With `ceph_osd_device` set, the
-   Ceph signature is wiped from that disk (`wipefs --all`), only when it is a whole
+   Ceph signature is wiped from that disk (`wipefs --all`, then every BlueStore
+   label copy that fits on the disk is zeroed, since Ceph 19 keeps copies at 0, 1,
+   10, 100 and 1000 GiB), only when it is a whole
    disk without partitions that is blank or carries a Ceph signature; otherwise it is
    left alone and the report says so. Each disk in `local_volume_devices` that is a
    whole disk carrying the `local_volume_fstype` file system, mounted at its own
@@ -849,69 +875,29 @@ Read this before using the toolkit outside an isolated lab.
 
 ## Known limitations / validation status
 
-<!-- VALIDATION-STATUS -->
-Validated on 2026-10-05/06 in a lab of KVM virtual machines (one jump host, three
-control plane nodes, four workers, all sized to the Pro and Ultimate requirements of
-[Hosts](#hosts), 150 GB worker disks, no licence key) with both lab shortcuts, which were the defaults of
-that revision (loop device for Ceph, bind-mounted directories for the local
-volumes), one fresh installation per profile:
+Every scenario below was run in a lab of virtual machines on VLAN-separated
+networks, with the NKP CLI 2.18.0, no licence activated and the host sizes of
+[Hosts](#hosts) unless stated otherwise. "Passed" means the command ended without
+a failed task and the checks listed in the row held.
 
-| Profile | Installation | Day-2 (`remove-worker` then `add-worker` of the same host) | CIS audit |
-|---|---|---|---|
-| `ubuntu` | passed, 62 min | passed | - |
-| `ubuntu-cis` | passed, 67 min | passed | 65 PASS, 0 FAIL |
-| `rocky` | passed, 155 min | passed | - |
-| `rocky-cis` | passed, 164 min | passed | 65 PASS, 0 FAIL |
+| Scenario | Result |
+|---|---|
+| Fresh installation, 4 OS profiles, lab shortcuts (loop device for Ceph, bind-mounted directories for the local volumes), 2026-10-05/06 | Passed on `ubuntu` (62 min), `ubuntu-cis` (67 min), `rocky` (155 min), `rocky-cis` (164 min). All 38 Kommander HelmReleases Ready, Rook Ceph `HEALTH_OK` with four OSDs, no PersistentVolumeClaim pending, default `Pro` licence reported. Rocky takes longer because the NKP CLI provisions the control plane nodes one after the other, 20-30 minutes each |
+| CIS audit after a `-cis` installation | 65 PASS, 0 FAIL on both `ubuntu-cis` and `rocky-cis` |
+| Day-2 cycle (`remove-worker` then `add-worker` of the same host), 4 OS profiles | Passed on every profile. The rejoined worker was Ready, held a new OSD and Ceph was back to `HEALTH_OK` |
+| Fresh installation with the guide disk layout (raw Ceph disk, one disk per local volume), VMs created by `tofu/proxmox` with `sizing_profile = pro-ultimate`, `ubuntu-cis`, 2026-10-07 | Passed in 53 min. CIS audit 65 PASS, 0 FAIL; all 34 HelmReleases Ready; Ceph `HEALTH_OK` with one OSD per worker on its `nkp-ceph` disk; every PersistentVolumeClaim bound to a local volume disk (Prometheus: 100 GiB on `/mnt/disks/vol3`) |
+| `./deploy.sh tofu-verify` on those VMs | Passed (devices, interface, cloud-init, layer-2 VIP test). It also showed why stable disk paths are needed: on one worker the kernel named the Ceph disk `sdc` and a local volume disk `sdb`, and after a reboot the same worker named the Ceph disk `sdb` |
+| Day-2 cycle on the worker with the swapped kernel names | Passed: new OSD on `nkp-ceph`, the four volumes formatted and mounted again, Ceph `HEALTH_OK`, CIS audit of the node passed. A first attempt showed that `wipefs` alone leaves copies of the BlueStore label that Ceph 19 writes deeper in the disk, so the old OSD was reused and failed to start; the cleanup now zeroes every label copy |
+| `tofu/proxmox` after the move onto the shared layout module | A plan of the new code against VMs created by the previous release showed no changes |
+| `tofu/nutanix` contract test, Prism Central 7.6 on a single-node AHV cluster, `contract-test` VMs, 2026-10-08 | Passed for Rocky Linux 9 and Ubuntu 24.04 on a subnet without IPAM, and for Ubuntu 24.04 on a subnet with AHV IPAM (addresses inside the pool; the VIP answered both inside and outside the pool). Changing the OS rebuilt the VMs; a plan right after an apply showed no changes |
+| `tofu/esxi` contract test, ESXi 8.0 Update 3e with the free licence (vSphere 8 Hypervisor) and ESXi 8.0 Update 3 in evaluation, 2026-10-08/09 | Passed for Rocky Linux 9 and Ubuntu 24.04. Changing the OS rebuilt the base disk and the VMs; an apply interrupted during a disk copy recovered on the next run; a second OpenTofu state creating the same VM names on the same host was refused and left the first lab untouched; destroy left the datastore empty |
+| Licence activation in the NKP dashboard with an NKP Ultimate key issued for the Cluster UUID the summary prints, 2026-10-09 | Passed: the dashboard reported the licence as valid with its expiry and core usage, and `./deploy.sh install --tags kommander_deploy` printed the activated tier read from the cluster. A key issued for the UID of the `kube-system` namespace was rejected ("License key is not valid for this cluster"): the Cluster UUID is the UID of the Cluster API cluster object |
+| `tofu/vsphere` contract test, vCenter 8.0 Update 3 (VCSA tiny) with one ESXi 8.0 Update 3 host, 2026-10-09 | Passed for Ubuntu 24.04 and Rocky Linux 9 (OVA built from the cloud image, content library clone, cidata ISO). Changing the OS rebuilt the image and the VMs; a plan right after an apply showed no changes |
 
-After every installation all 38 Kommander HelmReleases were Ready, Rook Ceph was
-`HEALTH_OK` with four OSDs, no PersistentVolumeClaim was pending and the cluster
-reported the default `Pro` licence. After every Day-2 cycle the rejoined worker was
-Ready, held a new OSD and Ceph was back to `HEALTH_OK`. Control plane nodes are
-provisioned one after the other by the NKP CLI and take 20-30 minutes each on
-Rocky Linux, which explains the longer times.
-
-The guide disk layout (raw Ceph disk, one disk per local volume), the OpenTofu
-Proxmox module and `./deploy.sh tofu-verify` were validated as follows:
-
-<!-- DISK-LAYOUT-VALIDATION -->
-on 2026-10-07, same lab, profile `ubuntu-cis`, VMs created by `tofu/proxmox`
-(`sizing_profile = pro-ultimate`: 80 GB OS disk, 50 GB Ceph disk and four 110 GB
-local volume disks per worker), data disks given as the `/dev/disk/by-id` paths of
-the generated inventory snippet:
-
-- `./deploy.sh tofu-verify` passed (devices, interface, cloud-init, layer-2 VIP
-  test). It also showed why stable paths are needed: on one worker the kernel had
-  named the Ceph disk `sdc` and a local volume disk `sdb`, and after a reboot the
-  same worker named the Ceph disk `sdb` again.
-- Fresh installation passed in 53 minutes; CIS audit 65 PASS, 0 FAIL; all 34
-  Kommander HelmReleases Ready; Rook Ceph `HEALTH_OK` with one OSD per worker, each
-  on its `nkp-ceph` disk; every PersistentVolumeClaim bound to a local volume disk
-  (Prometheus: 100 GiB on `/mnt/disks/vol3`).
-- Day-2 cycle (`remove-worker` then `add-worker`) of the worker with the swapped
-  kernel names passed: the rejoined worker held a new OSD on `nkp-ceph`, its four
-  volumes were formatted and mounted again, Ceph was back to `HEALTH_OK` and the
-  CIS audit of the node passed. A first attempt showed that `wipefs` alone left
-  copies of the BlueStore label that Ceph 19 writes deeper in the disk, so the old
-  OSD was reused and failed to start; the cleanup now zeroes every label copy.
-
-<!-- TOFU-MODULES-VALIDATION -->
-The provisioning modules other than Proxmox were validated on 2026-10-08/09 with
-`contract-test` VMs (one jump host, one control plane node, one worker) and
-`./deploy.sh tofu-verify`, no NKP installation:
-
-| Module | Platform | Result |
-|---|---|---|
-| `tofu/nutanix` | Prism Central 7.6, AHV (single node) | passed for Rocky Linux 9 and Ubuntu 24.04 on a subnet without IPAM, and for Ubuntu 24.04 on a subnet with AHV IPAM (addresses inside the pool; the VIP answered both inside and outside the pool). Changing the OS rebuilt the VMs; a plan right after an apply showed no changes |
-| `tofu/esxi` | ESXi 8.0 Update 3e, free licence (vSphere 8 Hypervisor); ESXi 8.0 Update 3 in evaluation | passed for Rocky Linux 9 and Ubuntu 24.04. Changing the OS rebuilt the base disk and the VMs; an apply interrupted during a disk copy recovered on the next run; a second OpenTofu state creating the same VM names on the same host was refused and left the first lab untouched; destroy left the datastore empty |
-| `tofu/vsphere` | vCenter 8.0 Update 3 (VCSA tiny) with one ESXi 8.0 Update 3 host | passed for Ubuntu 24.04 and Rocky Linux 9 (OVA built from the cloud image, content library clone, cidata ISO). Changing the OS rebuilt the image and the VMs; a plan right after an apply showed no changes |
-
-`tofu/proxmox` was moved onto the shared layout module after its validation: a plan
-of the new code against VMs created by the previous release showed no changes.
-
-Not validated: hosts below the Pro and Ultimate requirements (lowered `preflight_*`
-thresholds), `cis_firewalld_on_nodes` / `cis_ufw_on_nodes`, `--cleanup-only`, licence activation (done in the dashboard, outside the toolkit), SSH on a port other than 22,
-bare-metal hosts, an NKP installation on VMs created by `tofu/nutanix`, `tofu/esxi`
-or `tofu/vsphere`.
+Not verified: hosts below the Pro and Ultimate requirements (lowered `preflight_*`
+thresholds), `cis_firewalld_on_nodes` / `cis_ufw_on_nodes`, `--cleanup-only`, SSH
+on a port other than 22, bare-metal hosts, and an NKP installation on VMs created by
+`tofu/nutanix`, `tofu/esxi` or `tofu/vsphere` (contract test only).
 
 Known limitations:
 
@@ -962,4 +948,4 @@ Copyright 2026 Marco Fabbri.
 
 Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE). This licence
 covers the content of this repository only. It grants no rights to Nutanix software
-or trademarks.
+or trademarks, and this automation grants no product entitlement.

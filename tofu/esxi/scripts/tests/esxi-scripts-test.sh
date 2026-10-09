@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Checks the ESXi scripts of tofu/esxi without a host: ssh, scp, qemu-img and
-# curl are replaced by fakes that log what they receive and answer from
-# environment variables. Covers what the review asked for: a create never
-# touches a VM or folder of another state, an interrupted conversion or import
-# is never reused, and datastore names with spaces survive the copy.
+# Checks the ESXi scripts of tofu/esxi without a host: ssh, scp and qemu-img
+# are replaced by fakes that log what they receive and answer from environment
+# variables; fetch-image.sh and make-cidata-iso.sh by stubs. It checks that a
+# create never touches a VM or folder of another state, that an interrupted
+# conversion or import is never reused, and that datastore names with spaces
+# survive the copy.
 # Usage: tofu/esxi/scripts/tests/esxi-scripts-test.sh
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"

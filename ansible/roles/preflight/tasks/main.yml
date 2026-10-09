@@ -404,11 +404,19 @@
   failed_when: false
 
 # No partition table, no mount point other than the volume's own, and no file
-# system other than the one the toolkit (or Ceph) writes itself.
+# system other than the one the toolkit (or Ceph) writes itself. A local volume
+# that a pod is using is also mounted by kubelet under /var/lib/kubelet/pods/,
+# and lsblk reports that mount point: it is the same disk doing its job on a
+# running cluster, not a foreign use.
 - name: Validate the data disks of the Worker carry no foreign signature and are not in use
   when: inventory_hostname in groups['workers']
   vars:
     preflight_disk_info: "{{ ((item.stdout | default('') or '{}') | from_json).blockdevices | default([{}]) | first | default({}) }}"
+    preflight_disk_mountpoint: "{{ preflight_disk_info.mountpoint | default('', true) }}"
+    preflight_disk_mount_ok: >-
+      {{ preflight_disk_mountpoint in item.item.mountpoints
+         or (item.item.mountpoints | select | list | length > 0
+             and preflight_disk_mountpoint is match('^/var/lib/kubelet/pods/')) }}
   ansible.builtin.assert:
     that:
       - item.rc == 0
@@ -416,13 +424,14 @@
       - preflight_disk_info.children | default([]) | length == 0
       - preflight_disk_info.pttype | default('', true) | length == 0
       - preflight_disk_info.fstype | default('', true) in ([''] + item.item.fstypes)
-      - preflight_disk_info.mountpoint | default('', true) in item.item.mountpoints
+      - preflight_disk_mount_ok | bool
     fail_msg: >-
       {{ item.item.value }} (/dev/{{ item.item.name }}) on Worker {{ inventory_hostname }}, {{ item.item.use }}, is in
       use or carries a foreign signature: it must be a whole disk without partition table (wipefs --all or sgdisk
       --zap-all clears it), with no file system other than {{ item.item.fstypes | join('/') }} and
       {{ 'no mount point' if item.item.mountpoints | select | list | length == 0
-         else 'no mount point other than ' ~ (item.item.mountpoints | select | join(', ')) }}.
+         else 'no mount point other than ' ~ (item.item.mountpoints | select | join(', '))
+              ~ ' (or a pod mount under /var/lib/kubelet/pods/ on a running cluster)' }}.
       The toolkit never erases a foreign file system. lsblk reported:
       {{ item.stdout | default('') }} {{ item.stderr | default('') }}
     quiet: true
