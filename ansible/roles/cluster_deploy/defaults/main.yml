@@ -1,0 +1,10 @@
+---
+# ==============================================================================
+# Role Defaults: cluster_deploy
+# ==============================================================================
+
+# How long "nkp create cluster" may take, in minutes. The nodes are provisioned
+# by the NKP CLI itself and the control plane nodes one after the other: in a
+# lab this took about 40 minutes on Ubuntu 24.04 and more than 70 on Rocky
+# Linux 9 (three control plane nodes, four workers).
+cluster_deploy_create_timeout_minutes: 150

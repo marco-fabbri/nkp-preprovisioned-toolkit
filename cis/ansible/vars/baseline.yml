@@ -1,0 +1,145 @@
+---
+# Data shared by tasks/hardening.yml and tasks/audit.yml, so that the audit
+# checks exactly what the hardening applies.
+
+# Kubernetes-specific settings are applied only to cluster nodes; the jump host
+# gets the generic baseline.
+cis_is_k8s_node: "{{ inventory_hostname in (groups['nkp_nodes'] | default([])) }}"
+
+# Host firewall (control 9). The NKP guide requires firewalld to be disabled on
+# pre-provisioned machines, so on cluster nodes the firewall is managed only
+# when the inventory opts in (cis_firewalld_on_nodes on Rocky, cis_ufw_on_nodes
+# on Ubuntu; both default to false in role "common"). Other hosts (the jump
+# host) always get it.
+cis_firewall_on_nodes: >-
+  {{ (cis_firewalld_on_nodes | default(false) | bool)
+     if ansible_facts['os_family'] == 'RedHat'
+     else (cis_ufw_on_nodes | default(false) | bool) }}
+cis_firewall_managed: "{{ not (cis_is_k8s_node | bool) or (cis_firewall_on_nodes | bool) }}"
+cis_firewall_package: "{{ 'firewalld' if ansible_facts['os_family'] == 'RedHat' else 'ufw' }}"
+cis_firewall_not_applied_note: >-
+  NOT APPLIED (by design on cluster nodes: NKP prerequisite,
+  {{ 'cis_firewalld_on_nodes' if ansible_facts['os_family'] == 'RedHat' else 'cis_ufw_on_nodes' }}=false)
+
+# SSH port kept open in the host firewall: the one Ansible connects to.
+cis_ssh_port: "{{ ansible_port | default(22) | int }}"
+
+cis_fs_modules:
+  - cramfs
+  - freevxfs
+  - hfs
+  - hfsplus
+  - jffs2
+  - udf
+
+cis_sysctl_common:
+  - kernel.randomize_va_space=2
+  - fs.suid_dumpable=0
+  - net.ipv4.conf.all.send_redirects=0
+  - net.ipv4.conf.default.send_redirects=0
+  - net.ipv4.conf.all.accept_source_route=0
+  - net.ipv4.conf.default.accept_source_route=0
+  - net.ipv4.conf.all.accept_redirects=0
+  - net.ipv4.conf.default.accept_redirects=0
+  - net.ipv4.conf.all.secure_redirects=0
+  - net.ipv4.conf.default.secure_redirects=0
+  - net.ipv4.conf.all.log_martians=1
+  - net.ipv4.conf.default.log_martians=1
+  - net.ipv4.icmp_echo_ignore_broadcasts=1
+  - net.ipv4.tcp_syncookies=1
+
+# Deviations from the benchmark required by Kubernetes and the CNI.
+cis_sysctl_k8s:
+  - net.ipv4.ip_forward=1
+  - net.bridge.bridge-nf-call-iptables=1
+  - net.bridge.bridge-nf-call-ip6tables=1
+  - net.ipv4.conf.all.rp_filter=0
+  - net.ipv4.conf.default.rp_filter=0
+
+cis_sysctl_settings: "{{ cis_sysctl_common + (cis_sysctl_k8s if cis_is_k8s_node | bool else []) }}"
+
+# UFW re-applies /etc/ufw/sysctl.conf at every start and would reset these keys.
+cis_ufw_sysctl_settings: >-
+  {{ cis_sysctl_settings
+     | select('match', '^net\.ipv4\.conf\.(all|default)\.(log_martians|rp_filter)=')
+     | list }}
+
+cis_packages: >-
+  {{ (['audit', 'audit-libs', 'chrony', 'cronie', 'libpwquality']
+      if ansible_facts['os_family'] == 'RedHat'
+      else ['auditd', 'chrony', 'cron', 'libpam-pwquality'])
+     + ([cis_firewall_package] if cis_firewall_managed | bool else []) }}
+
+cis_services:
+  - auditd
+  - "{{ 'chronyd' if ansible_facts['os_family'] == 'RedHat' else 'chrony' }}"
+  - "{{ 'crond' if ansible_facts['os_family'] == 'RedHat' else 'cron' }}"
+
+cis_auditd_keys:
+  - time-change
+  - identity
+  - system-locale
+  - scope
+  - modules
+
+# Rocky ships shadow files as 0000 root:root, Ubuntu as 0640 root:shadow.
+cis_shadow_mode: "{{ '0000' if ansible_facts['os_family'] == 'RedHat' else '0640' }}"
+cis_shadow_group: "{{ 'root' if ansible_facts['os_family'] == 'RedHat' else 'shadow' }}"
+
+cis_file_permissions:
+  - {path: /etc/passwd, mode: '0644', group: root}
+  - {path: /etc/group, mode: '0644', group: root}
+  - {path: /etc/shadow, mode: "{{ cis_shadow_mode }}", group: "{{ cis_shadow_group }}"}
+  - {path: /etc/gshadow, mode: "{{ cis_shadow_mode }}", group: "{{ cis_shadow_group }}"}
+  - {path: /etc/crontab, mode: '0600', group: root}
+  - {path: /etc/cron.hourly, mode: '0700', group: root}
+  - {path: /etc/cron.daily, mode: '0700', group: root}
+  - {path: /etc/cron.weekly, mode: '0700', group: root}
+  - {path: /etc/cron.monthly, mode: '0700', group: root}
+  - {path: /etc/cron.d, mode: '0700', group: root}
+
+cis_banner_files:
+  - /etc/issue
+  - /etc/issue.net
+  - /etc/motd
+
+# sshd uses the first value it reads, so the drop-in sorts before any other one.
+cis_sshd_dropin: /etc/ssh/sshd_config.d/00-cis.conf
+cis_sshd_settings:
+  - LogLevel INFO
+  - MaxAuthTries 4
+  - IgnoreRhosts yes
+  - HostbasedAuthentication no
+  - PermitEmptyPasswords no
+  - PermitRootLogin no
+  - ClientAliveInterval 300
+  - ClientAliveCountMax 3
+  - LoginGraceTime 60
+  - X11Forwarding no
+  - Banner /etc/issue.net
+
+# Sources allowed to reach every port of a cluster node. cis_extra_trusted_cidrs
+# is an optional inventory list, e.g. for a jump host outside the node subnet.
+# It arrives as a string when passed as -e key=value: both forms are accepted.
+cis_extra_trusted_list: >-
+  {{ (cis_extra_trusted_cidrs | default([]) | from_yaml)
+     if (cis_extra_trusted_cidrs | default([])) is string
+     else (cis_extra_trusted_cidrs | default([])) }}
+cis_firewall_trusted_sources: "{{ [node_subnet_cidr, pod_cidr] + cis_extra_trusted_list }}"
+
+cis_controls:
+  - {id: 1, title: Unused filesystem kernel modules disabled}
+  - {id: 2, title: Kernel parameters (sysctl)}
+  - {id: 3, title: 'auditd, chrony and cron running'}
+  - {id: 4, title: auditd rules loaded}
+  - {id: 5, title: Identity file and cron permissions}
+  - {id: 6, title: Account and password defaults}
+  - {id: 7, title: Login warning banners}
+  - {id: 8, title: OpenSSH daemon settings}
+  - {id: 9, title: Host firewall active with allow-list}
+
+# Services the firewalld default zone of Rocky allows out of the box and the
+# baseline removes (SSH stays).
+cis_firewalld_default_services_to_remove:
+  - cockpit
+  - dhcpv6-client

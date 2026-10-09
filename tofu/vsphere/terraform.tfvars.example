@@ -1,0 +1,41 @@
+# Copy to terraform.tfvars (gitignored) and adapt. The addresses are examples
+# and match inventory.example.ini.
+
+# --- vCenter access -----------------------------------------------------------
+vsphere_server   = "vcenter.example.com"
+vsphere_user     = "administrator@vsphere.local"
+vsphere_password = "secret"
+# vsphere_insecure = true  # self-signed lab certificate
+
+# --- Placement ------------------------------------------------------------------
+vsphere_datacenter = "dc1"
+vsphere_cluster    = "cluster1"
+vsphere_datastore  = "datastore1"
+vsphere_network    = "VM Network"
+# vsphere_folder          = "nkp"
+# vsphere_content_library = "nkp-images"
+
+# --- VM layout ----------------------------------------------------------------
+# rocky9 or ubuntu24. ./deploy.sh tofu-* overrides it from os_profile when
+# inventory.ini exists.
+os_distribution = "rocky9"
+# pro-ultimate (NKP sizes) or contract-test (tiny VMs for ./deploy.sh tofu-verify
+# only). ./deploy.sh tofu-* overrides it from tofu_sizing_profile when that key
+# is set in inventory.ini.
+sizing_profile = "pro-ultimate"
+vm_user        = "nutanix"
+ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@laptop"
+
+# Worker disk sizes in GB; unset = profile default (50 / 110, contract-test 5 / 5)
+# ceph_disk_size_gb    = 50
+# local_volume_size_gb = 110
+
+# --- Network ------------------------------------------------------------------
+network_gateway       = "10.10.10.1"
+network_prefix_length = 24
+dns_servers           = ["10.10.10.1", "1.1.1.1"]
+
+jump_host_ip      = "10.10.10.80"
+control_plane_ips = ["10.10.10.81", "10.10.10.82", "10.10.10.83"] # 1 or 3 addresses
+control_plane_vip = "10.10.10.85"                                 # not assigned to a VM
+worker_ips        = ["10.10.10.86", "10.10.10.87", "10.10.10.88", "10.10.10.89"]

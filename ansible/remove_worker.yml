@@ -1,0 +1,1051 @@
+---
+# ==============================================================================
+# Playbook: remove_worker.yml - Scale-in of a worker node through Cluster API
+# ==============================================================================
+# Usage (normally called by scripts/remove-node.sh):
+#   ansible-playbook -i inventory.ini ansible/remove_worker.yml -e '{"target_node": "nkp-worker-02"}'
+#   ansible-playbook -i inventory.ini ansible/remove_worker.yml -e '{"target_node": "10.10.10.87"}'
+#
+# Flow: resolve the node exactly -> safety guards -> confirmation -> annotate the
+# Machine for deletion and scale the MachineDeployment by -1 (Cluster API cordons,
+# drains and deletes the node) -> remove the IP from the PreprovisionedInventory ->
+# clean up the operating system of the host (kubeadm reset, Kubernetes, CNI and
+# Ceph leftovers, Ceph OSD disk and local volume devices wiped) -> remove the
+# host from inventory.ini.
+#
+# Optional extra vars:
+#   assume_yes=true            skip the interactive confirmation
+#   force=true                 proceed even if Rook Ceph is not HEALTH_OK
+#   min_workers=2              Ready schedulable workers that must remain
+#   cleanup_only=true          skip the drain and scale-in: clean up the OS of a host that is no
+#                              longer a cluster node, and drop its leftover PreprovisionedInventory
+#                              entry and inventory.ini line. target_node must be the host IP. The
+#                              cluster kubeconfig on the jump host is still required.
+#   cleanup_force=true         cleanup_only: also clean a host that is not recognised as a former
+#                              member of this cluster (unknown host, or kubelet of another cluster)
+#   ceph_host=nkp-worker-02    cleanup_only: Kubernetes name the host had as a node, so that its
+#                              Ceph OSD can be purged; without it no purge is attempted
+#   reboot_after_cleanup=true  reboot the host at the end of the OS cleanup
+#   day2_wait_timeout=1800     seconds to wait for Machine and Node deletion
+# ==============================================================================
+
+- name: Resolve the target, run safety guards and remove the node through Cluster API
+  hosts: jump_host
+  gather_facts: false
+  become: false
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  vars:
+    day2_ipv4_regex: '^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
+    day2_kubectl: ['kubectl', '--kubeconfig', "{{ cluster_kubeconfig }}"]
+    day2_cleanup_only: "{{ cleanup_only | default(false) | bool }}"
+    day2_force: "{{ force | default(false) | bool }}"
+    day2_min_workers: "{{ min_workers | default(2) | int }}"
+    day2_retries: "{{ ((day2_wait_timeout | default(1800) | int) / 20) | int }}"
+    day2_protected_ips: >-
+      {{ (groups['control_plane'] + groups['jump_host']) | map('extract', hostvars)
+         | map(attribute='ansible_host', default='') | list + [control_plane_vip] }}
+  roles:
+    - role: common
+  tasks:
+    - name: Verify target_node is provided and well formed
+      ansible.builtin.assert:
+        that:
+          - target_node is defined
+          - target_node is string
+          - target_node is match(day2_ipv4_regex) or target_node is match('^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$')
+          - not day2_cleanup_only or target_node is match(day2_ipv4_regex)
+        fail_msg: >-
+          Parameter 'target_node' is mandatory: the exact Kubernetes node name (e.g. nkp-worker-02) or one of its
+          addresses (e.g. 10.10.10.87). With cleanup_only=true it must be the IPv4 address of the host.
+        quiet: true
+
+    - name: Retrieve current node list from the cluster
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'nodes', '-o', 'json'] }}"
+      register: day2_nodes_raw
+      changed_when: false
+
+    # Exact match only: node name equality or membership in status.addresses.
+    - name: Select nodes matching the target exactly
+      ansible.builtin.set_fact:
+        day2_matches: "{{ day2_matches | default([]) + [item] }}"
+      loop: "{{ (day2_nodes_raw.stdout | from_json)['items'] }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: >-
+        item.metadata.name == target_node or
+        target_node in (item.status.addresses | default([]) | map(attribute='address') | list)
+
+    - name: Retrieve Cluster API Machines
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'machines.cluster.x-k8s.io', '-A', '-o', 'json'] }}"
+      register: day2_machines_raw
+      changed_when: false
+
+    - name: Retrieve PreprovisionedInventory objects
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'preprovisionedinventory', '-A', '-o', 'json'] }}"
+      register: day2_inventories_raw
+      changed_when: false
+
+    - name: Retrieve Cluster API MachineDeployments
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'machinedeployments.cluster.x-k8s.io', '-A', '-o', 'json'] }}"
+      register: day2_mds_raw
+      changed_when: false
+
+    # Both modes: the health guard uses it, and so does the OSD purge.
+    - name: Check whether Rook Ceph is installed
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'crd', 'cephclusters.ceph.rook.io', '--ignore-not-found', '-o', 'name'] }}"
+      register: day2_ceph_crd
+      changed_when: false
+
+    - name: Read Rook CephCluster health
+      when: day2_ceph_crd.stdout | trim | length > 0
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'cephclusters.ceph.rook.io', '-A', '-o', day2_ceph_jsonpath] }}"
+      vars:
+        day2_ceph_jsonpath: 'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}={.status.ceph.health} {.status.ceph.details}{"\n"}{end}'
+      register: day2_ceph_health
+      changed_when: false
+
+    - name: Register Rook Ceph health
+      ansible.builtin.set_fact:
+        day2_ceph_lines: "{{ day2_ceph_health.stdout_lines | default([]) }}"
+        day2_ceph_unhealthy: "{{ day2_ceph_health.stdout_lines | default([]) | reject('match', '.*=HEALTH_OK( .*)?$') | list }}"
+
+    # ------------------------------------------------------------------------
+    # Cleanup-only mode: the host must no longer be part of the cluster
+    # ------------------------------------------------------------------------
+    - name: Verify the host can be cleaned up without touching the cluster (cleanup_only)
+      when: day2_cleanup_only
+      block:
+        - name: Verify ceph_host is a node name that is no longer in the cluster
+          when: ceph_host is defined
+          ansible.builtin.assert:
+            that:
+              - ceph_host is string
+              - ceph_host is match('^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$')
+              - ceph_host not in ((day2_nodes_raw.stdout | from_json)['items'] | map(attribute='metadata.name') | list)
+            fail_msg: >-
+              ceph_host '{{ ceph_host }}' is not a valid node name or is still a node of the cluster: its OSDs
+              are in use. Pass the name the removed host had as a node. Nothing was changed.
+            quiet: true
+
+        - name: Select Machines that still reference the IP
+          ansible.builtin.set_fact:
+            day2_machines_with_ip: "{{ day2_machines_with_ip | default([]) + [item.metadata.name] }}"
+          loop: "{{ (day2_machines_raw.stdout | from_json)['items'] }}"
+          loop_control:
+            label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+          when: target_node in (item.status.addresses | default([]) | map(attribute='address') | list)
+
+        - name: Refuse to clean up a host that is still a cluster member
+          ansible.builtin.assert:
+            that:
+              - day2_matches | default([]) | length == 0
+              - day2_machines_with_ip | default([]) | length == 0
+              - target_node not in day2_protected_ips
+            fail_msg: >-
+              Refusing OS cleanup of {{ target_node }}: it is still a Kubernetes node or Cluster API Machine
+              ({{ (day2_matches | default([]) | map(attribute='metadata.name') | list + day2_machines_with_ip | default([])) | join(', ') }}),
+              or it is a control plane / jump host / VIP address. Run the normal removal first; if its Machine
+              is already being deleted, wait until it is gone.
+            quiet: true
+
+        # A Machine that never finished provisioning (failed add-worker) exposes
+        # no address, so the guard above cannot see it. It shows as a node pool
+        # that would keep more replicas than hosts once the IP is dropped.
+        - name: Select node pools that would be left with more replicas than hosts
+          ansible.builtin.set_fact:
+            day2_overcommitted_pools: >-
+              {{ day2_overcommitted_pools | default([]) + [{
+                   'namespace': item.metadata.namespace,
+                   'name': item.metadata.name,
+                   'replicas': day2_pool_md[0].spec.replicas | default(0) | int,
+                   'hosts': item.spec.hosts | length}] }}
+          vars:
+            day2_pool_md: >-
+              {{ (day2_mds_raw.stdout | from_json)['items']
+                 | selectattr('metadata.namespace', 'equalto', item.metadata.namespace)
+                 | selectattr('metadata.name', 'equalto', item.metadata.name) | list }}
+          loop: "{{ (day2_inventories_raw.stdout | from_json)['items'] }}"
+          loop_control:
+            label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+          when:
+            - (item.metadata.labels | default({}))['cluster.x-k8s.io/cluster-name'] | default(cluster_name) == cluster_name
+            - target_node in (item.spec.hosts | default([]) | map(attribute='address') | list)
+            - day2_pool_md | length == 1
+            - (day2_pool_md[0].spec.replicas | default(0) | int) > (item.spec.hosts | length) - 1
+
+        - name: Select worker Machines that have no node
+          ansible.builtin.set_fact:
+            day2_machines_without_node: "{{ day2_machines_without_node | default([]) + [item.metadata.name] }}"
+          loop: "{{ (day2_machines_raw.stdout | from_json)['items'] }}"
+          loop_control:
+            label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+          when:
+            - item.spec.clusterName == cluster_name
+            - "'cluster.x-k8s.io/deployment-name' in (item.metadata.labels | default({}))"
+            - item.status.nodeRef is not defined
+
+        - name: Refuse to drop an address that a pending Machine still needs
+          ansible.builtin.assert:
+            that:
+              - day2_overcommitted_pools | default([]) | length == 0
+            fail_msg: >-
+              Refusing cleanup of {{ target_node }}: it is listed in PreprovisionedInventory
+              {{ day2_pool.namespace }}/{{ day2_pool.name }} ({{ day2_pool.hosts }} hosts) and the node pool has
+              {{ day2_pool.replicas }} replicas. Dropping the address would leave a Machine without a host
+              (usual after a failed add-worker). Roll the scale-out back first, on the jump host with
+              kubectl --kubeconfig {{ cluster_kubeconfig }}:
+              (1) kubectl annotate machine <machine> -n {{ day2_pool.namespace }} cluster.x-k8s.io/delete-machine=yes,
+              where <machine> is the Machine without a node
+              ({{ day2_machines_without_node | default([]) | join(', ') or 'none found: check kubectl get machines -A' }});
+              (2) kubectl scale machinedeployment {{ day2_pool.name }} -n {{ day2_pool.namespace }} --replicas={{ day2_pool.hosts - 1 }};
+              (3) wait until that Machine is gone; (4) run this command again. Nothing was changed.
+            quiet: true
+          vars:
+            # fail_msg is rendered even when the assertion holds: keep a complete placeholder.
+            day2_pool: >-
+              {{ (day2_overcommitted_pools | default([]) + [{'namespace': '-', 'name': '-', 'replicas': 0, 'hosts': 1}]) | first }}
+
+        - name: Register the host to clean up
+          ansible.builtin.set_fact:
+            day2_node_ip: "{{ target_node }}"
+            day2_node_name: "{{ target_node }}"
+            day2_cluster_removal_done: false
+
+    # ------------------------------------------------------------------------
+    # Normal mode: resolve, guard, confirm, remove through Cluster API
+    # ------------------------------------------------------------------------
+    - name: Resolve target and run safety guards
+      when: not day2_cleanup_only
+      block:
+        - name: Verify exactly one node matches the target
+          ansible.builtin.assert:
+            that:
+              - day2_matches | default([]) | length == 1
+            fail_msg: >-
+              Target '{{ target_node }}' matches {{ day2_matches | default([]) | length }} nodes
+              ({{ day2_matches | default([]) | map(attribute='metadata.name') | join(', ') }}); exactly one is required.
+              Use the exact name or address shown by 'kubectl get nodes -o wide'. If the node was already removed
+              from the cluster and only the host is left to clean, use cleanup_only=true with its IP.
+            quiet: true
+
+        - name: Register resolved node
+          ansible.builtin.set_fact:
+            day2_node_name: "{{ day2_matches[0].metadata.name }}"
+            day2_node_ip: >-
+              {{ day2_matches[0].status.addresses | selectattr('type', 'equalto', 'InternalIP')
+                 | map(attribute='address') | list | first | default('') }}
+
+        - name: Verify the target is a worker and not a control plane node
+          ansible.builtin.assert:
+            that:
+              - "'node-role.kubernetes.io/control-plane' not in (day2_matches[0].metadata.labels | default({}))"
+              - day2_node_ip | length > 0
+              - day2_node_ip not in day2_protected_ips
+            fail_msg: >-
+              Node '{{ day2_node_name }}' ({{ day2_node_ip }}) is a control plane node, the jump host or has no InternalIP.
+              This playbook only removes worker nodes.
+            quiet: true
+
+        - name: Select Ready and schedulable workers that would remain
+          ansible.builtin.set_fact:
+            day2_remaining_workers: "{{ day2_remaining_workers | default([]) + [item.metadata.name] }}"
+          loop: "{{ (day2_nodes_raw.stdout | from_json)['items'] }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+          when:
+            - item.metadata.name != day2_node_name
+            - "'node-role.kubernetes.io/control-plane' not in (item.metadata.labels | default({}))"
+            - not (item.spec.unschedulable | default(false))
+            - item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length == 1
+
+        - name: Verify enough Ready workers remain after the removal
+          ansible.builtin.assert:
+            that:
+              - day2_remaining_workers | default([]) | length >= day2_min_workers | int
+            fail_msg: >-
+              After removing '{{ day2_node_name }}' only {{ day2_remaining_workers | default([]) | length }} Ready and
+              schedulable workers would remain; the minimum is {{ day2_min_workers }} (Kommander platform services and
+              Rook Ceph need them). Override with -e min_workers=<n> only if you know the consequences.
+            quiet: true
+
+        - name: Select the Cluster API Machine of the node
+          ansible.builtin.set_fact:
+            day2_machine_matches: "{{ day2_machine_matches | default([]) + [item] }}"
+          loop: "{{ (day2_machines_raw.stdout | from_json)['items'] }}"
+          loop_control:
+            label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+          when:
+            - item.spec.clusterName == cluster_name
+            - (item.status.nodeRef.name | default('')) == day2_node_name
+
+        - name: Verify the node is managed by a worker MachineDeployment
+          ansible.builtin.assert:
+            that:
+              - day2_machine_matches | default([]) | length == 1
+              - "'cluster.x-k8s.io/deployment-name' in day2_machine_matches[0].metadata.labels"
+              - "'cluster.x-k8s.io/control-plane' not in day2_machine_matches[0].metadata.labels"
+            fail_msg: >-
+              Node '{{ day2_node_name }}' has no matching worker Machine in cluster '{{ cluster_name }}'
+              (found {{ day2_machine_matches | default([]) | length }}). It was probably joined outside Cluster API:
+              remove it manually (kubectl drain, kubectl delete node), then run this command with cleanup_only=true
+              and the host IP.
+            quiet: true
+
+        - name: Register Cluster API objects of the node
+          ansible.builtin.set_fact:
+            day2_machine_name: "{{ day2_machine_matches[0].metadata.name }}"
+            day2_capi_namespace: "{{ day2_machine_matches[0].metadata.namespace }}"
+            day2_md_name: "{{ day2_machine_matches[0].metadata.labels['cluster.x-k8s.io/deployment-name'] }}"
+            day2_machine_deleting: "{{ day2_machine_matches[0].metadata.deletionTimestamp is defined }}"
+            day2_machine_annotated: >-
+              {{ 'cluster.x-k8s.io/delete-machine' in (day2_machine_matches[0].metadata.annotations | default({})) }}
+
+        # Not enforced when the Machine is already being deleted: Ceph is then degraded
+        # by this very removal and the run only resumes waiting for it.
+        - name: Refuse removal while Rook Ceph is not healthy
+          ansible.builtin.assert:
+            that:
+              - day2_ceph_unhealthy | length == 0 or day2_force or (day2_machine_deleting | bool)
+            fail_msg: >-
+              Rook Ceph is not HEALTH_OK ({{ day2_ceph_unhealthy | join(', ') }}). Removing a worker removes its OSD and
+              can destroy the last healthy copy of the data. Fix Ceph first, or override with force=true (--force).
+            quiet: true
+
+        - name: Read current replicas of the worker MachineDeployment
+          ansible.builtin.command:
+            argv: >-
+              {{ day2_kubectl + ['get', 'machinedeployments.cluster.x-k8s.io', day2_md_name, '-n', day2_capi_namespace,
+                                 '-o', 'jsonpath={.spec.replicas}'] }}
+          register: day2_md_replicas_raw
+          changed_when: false
+
+        # Machines of the same node pool that are not being deleted yet.
+        - name: Register current replicas and active Machines of the node pool
+          ansible.builtin.set_fact:
+            day2_replicas: "{{ day2_md_replicas_raw.stdout | int }}"
+            day2_md_active_machines: >-
+              {%- set ns = namespace(count=0) -%}
+              {%- for machine in (day2_machines_raw.stdout | from_json)['items'] -%}
+              {%- if machine.spec.clusterName == cluster_name
+                    and machine.metadata.namespace == day2_capi_namespace
+                    and (machine.metadata.labels | default({})).get('cluster.x-k8s.io/deployment-name', '') == day2_md_name
+                    and machine.metadata.deletionTimestamp is not defined -%}
+              {%- set ns.count = ns.count + 1 -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ ns.count }}
+
+        # A previous run may have stopped right after the scale, before Cluster API
+        # marked the Machine as deleting: the Machine carries the delete annotation
+        # and the pool already has fewer replicas than Machines. Scaling again would
+        # remove a second, arbitrary worker.
+        - name: Detect a scale-in that was already requested
+          ansible.builtin.set_fact:
+            day2_scale_requested: >-
+              {{ not (day2_machine_deleting | bool) and (day2_machine_annotated | bool)
+                 and (day2_replicas | int) < (day2_md_active_machines | int) }}
+
+        - name: Verify the node pool is in a steady state before scaling in
+          when:
+            - not (day2_machine_deleting | bool)
+            - not (day2_scale_requested | bool)
+          ansible.builtin.assert:
+            that:
+              - (day2_replicas | int) == (day2_md_active_machines | int)
+              - (day2_replicas | int) >= 1
+            fail_msg: >-
+              Node pool {{ day2_capi_namespace }}/{{ day2_md_name }} has {{ day2_replicas }} replicas but
+              {{ day2_md_active_machines }} Machines that are not being deleted: a scale or rollout is in
+              progress, or a Machine is stuck. A scale-in now could remove a different node than
+              '{{ day2_node_name }}'. Wait for the pool to settle (kubectl get machines -n {{ day2_capi_namespace }})
+              and run the command again. Nothing was changed.
+            quiet: true
+
+        - name: Ask for confirmation
+          when: not (assume_yes | default(false) | bool)
+          ansible.builtin.pause:
+            prompt: |-
+
+              About to REMOVE this worker from cluster '{{ cluster_name }}':
+                Node    : {{ day2_node_name }}
+                IP      : {{ day2_node_ip }}
+                Machine : {{ day2_capi_namespace }}/{{ day2_machine_name }}
+                Pool    : {{ day2_md_name }} ({{ day2_pool_change }})
+                Ceph    : {{ day2_ceph_lines | join(', ') if day2_ceph_lines | length > 0 else 'not installed' }}
+              Cluster API will drain and delete the node; its Ceph OSD disk and local volume devices are wiped and the host OS is cleaned.
+              Type the node name to confirm
+          register: day2_confirmation
+          vars:
+            day2_pool_change: >-
+              {{ 'scale-in already requested, resuming'
+                 if (day2_machine_deleting | bool) or (day2_scale_requested | bool)
+                 else day2_replicas ~ ' -> ' ~ ((day2_replicas | int) - 1) ~ ' replicas' }}
+
+        - name: Verify confirmation
+          when: not (assume_yes | default(false) | bool)
+          ansible.builtin.assert:
+            that:
+              - (day2_confirmation.user_input | default('') | trim) == day2_node_name
+            fail_msg: "Confirmation does not match '{{ day2_node_name }}': nothing was changed."
+            quiet: true
+
+    - name: Remove the node through Cluster API
+      when: not day2_cleanup_only
+      block:
+        - name: Mark the Machine for deletion
+          when: not (day2_machine_deleting | bool)
+          ansible.builtin.command:
+            argv: >-
+              {{ day2_kubectl + ['annotate', 'machines.cluster.x-k8s.io', day2_machine_name, '-n', day2_capi_namespace,
+                                 'cluster.x-k8s.io/delete-machine=yes', '--overwrite'] }}
+          changed_when: true
+
+        # --current-replicas makes the scale a no-op error instead of a double scale-in if the pool changed meanwhile.
+        - name: Scale the worker MachineDeployment by -1
+          when:
+            - not (day2_machine_deleting | bool)
+            - not (day2_scale_requested | bool)
+          ansible.builtin.command:
+            argv: >-
+              {{ day2_kubectl + ['scale', 'machinedeployments.cluster.x-k8s.io', day2_md_name, '-n', day2_capi_namespace,
+                                 '--current-replicas=' ~ day2_replicas, '--replicas=' ~ ((day2_replicas | int) - 1)] }}
+          changed_when: true
+
+        - name: Wait for the Machine to be deleted (Cluster API drains the node first)
+          ansible.builtin.command:
+            argv: >-
+              {{ day2_kubectl + ['get', 'machines.cluster.x-k8s.io', day2_machine_name, '-n', day2_capi_namespace,
+                                 '--ignore-not-found', '-o', 'name'] }}
+          register: day2_machine_wait
+          until: day2_machine_wait.rc == 0 and day2_machine_wait.stdout | trim | length == 0
+          retries: "{{ day2_retries }}"
+          delay: 20
+          changed_when: false
+
+        - name: Wait for the Node to disappear from the cluster
+          ansible.builtin.command:
+            argv: "{{ day2_kubectl + ['get', 'node', day2_node_name, '--ignore-not-found', '-o', 'name'] }}"
+          register: day2_node_wait
+          until: day2_node_wait.rc == 0 and day2_node_wait.stdout | trim | length == 0
+          retries: "{{ day2_retries }}"
+          delay: 20
+          changed_when: false
+
+        - name: Register completed cluster removal
+          ansible.builtin.set_fact:
+            day2_cluster_removal_done: true
+      rescue:
+        - name: Report incomplete removal
+          ansible.builtin.fail:
+            msg:
+              - "Removal of '{{ day2_node_name }}' through Cluster API did not complete (failed task: {{ ansible_failed_task.name }})."
+              - "The node may be cordoned and partially drained; a PodDisruptionBudget blocking eviction is the usual cause."
+              - "Inspect: kubectl describe machine -n {{ day2_capi_namespace }} {{ day2_machine_name }}"
+              - "Pods left: kubectl get pods -A -o wide --field-selector spec.nodeName={{ day2_node_name }}"
+              - "The host OS and inventory.ini were NOT modified. To continue, fix the blocker, then:"
+              - "  - Machine still listed (kubectl get machines -n {{ day2_capi_namespace }}): re-run this command. It resumes"
+              - "    waiting without scaling again, and the Ceph health guard is not enforced while the Machine is being deleted."
+              - "  - Machine and Node already gone (Cluster API finished on its own): finish with"
+              - "    ./scripts/remove-node.sh --cleanup-only --ip {{ day2_node_ip }} --name {{ day2_node_name }}"
+              - "    (--name lets it purge the Ceph OSD of the node)"
+
+    # ------------------------------------------------------------------------
+    # The OSD of the removed node stays registered as "down" and keeps Ceph
+    # degraded; a host that rejoins with the same name gets no new OSD until it
+    # is purged. Best effort: a failure is reported, it does not stop the run.
+    # Rook names the CRUSH host bucket after the node, dots replaced by dashes.
+    # In cleanup_only the node is gone: the name must come from ceph_host.
+    # Only the first CephCluster is handled.
+    # ------------------------------------------------------------------------
+    - name: Register the Ceph node name and namespace
+      ansible.builtin.set_fact:
+        day2_ceph_node_name: "{{ (ceph_host | default('')) if day2_cleanup_only else day2_node_name }}"
+        day2_ceph_ns: "{{ (day2_ceph_lines | first).split('/')[0] if day2_ceph_lines | length > 0 else '' }}"
+        day2_ceph_purge_wanted: "{{ (day2_cluster_removal_done | default(false) | bool) or day2_cleanup_only }}"
+
+    - name: Check for the rook-ceph-tools deployment
+      when:
+        - day2_ceph_purge_wanted | bool
+        - day2_ceph_ns | length > 0
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['-n', day2_ceph_ns, 'get', 'deployment', 'rook-ceph-tools', '--ignore-not-found', '-o', 'name'] }}"
+      register: day2_ceph_toolbox
+      changed_when: false
+      failed_when: false
+
+    - name: Purge the Ceph OSDs of the removed node
+      when:
+        - day2_ceph_purge_wanted | bool
+        - day2_ceph_ns | length > 0
+        - day2_ceph_node_name | length > 0
+        - day2_ceph_toolbox.stdout | default('') | trim | length > 0
+      vars:
+        day2_ceph_cli: "{{ day2_kubectl + ['-n', day2_ceph_ns, 'exec', 'deploy/rook-ceph-tools', '--', 'ceph'] }}"
+        day2_crush_host: "{{ day2_ceph_node_name | replace('.', '-') }}"
+        day2_ceph_other_clusters: >-
+          {{ '' if day2_ceph_lines | length == 1
+             else ' (cluster ' ~ day2_ceph_ns ~ ' only; ' ~ (day2_ceph_lines | length - 1) ~ ' other CephCluster not purged)' }}
+      block:
+        # The monitors mark the OSD down shortly after the node is gone: give them a minute.
+        - name: Read the Ceph OSD tree
+          ansible.builtin.command:
+            argv: "{{ day2_ceph_cli + ['osd', 'tree', '-f', 'json'] }}"
+          register: day2_osd_tree
+          changed_when: false
+          until: >-
+            day2_osd_tree.rc == 0 and
+            ((day2_osd_tree.stdout | from_json).nodes | selectattr('type', 'equalto', 'osd')
+             | selectattr('id', 'in', ((day2_osd_tree.stdout | from_json).nodes | selectattr('type', 'equalto', 'host')
+                                       | selectattr('name', 'equalto', day2_crush_host) | map(attribute='children') | flatten | list))
+             | rejectattr('status', 'equalto', 'down') | list | length == 0)
+          retries: 6
+          delay: 10
+
+        - name: Select the host bucket and the OSDs of the removed node
+          vars:
+            day2_tree_nodes: "{{ (day2_osd_tree.stdout | from_json).nodes }}"
+            day2_bucket_children: >-
+              {{ day2_tree_nodes | selectattr('type', 'equalto', 'host') | selectattr('name', 'equalto', day2_crush_host)
+                 | map(attribute='children') | flatten | list }}
+            day2_bucket_osds: "{{ day2_tree_nodes | selectattr('type', 'equalto', 'osd') | selectattr('id', 'in', day2_bucket_children) | list }}"
+          ansible.builtin.set_fact:
+            day2_bucket_found: >-
+              {{ day2_tree_nodes | selectattr('type', 'equalto', 'host') | selectattr('name', 'equalto', day2_crush_host) | list | length > 0 }}
+            day2_stale_osds: "{{ day2_bucket_osds | selectattr('status', 'equalto', 'down') | map(attribute='id') | list }}"
+            day2_up_osds: "{{ day2_bucket_osds | rejectattr('status', 'equalto', 'down') | map(attribute='id') | list }}"
+
+        # An OSD that is still up belongs to a live node (a name collision, or a wrong ceph_host).
+        - name: Refuse to purge while OSDs of the host bucket are still up
+          ansible.builtin.assert:
+            that:
+              - day2_up_osds | length == 0
+            fail_msg: >-
+              host bucket {{ day2_crush_host }} still has OSDs that are not down ({{ day2_up_osds | join(', ') }}):
+              they belong to a live node, nothing was purged
+            quiet: true
+
+        - name: Stop the OSD deployments of the removed node
+          ansible.builtin.command:
+            argv: "{{ day2_kubectl + ['-n', day2_ceph_ns, 'scale', 'deployment', 'rook-ceph-osd-' ~ item, '--replicas=0'] }}"
+          loop: "{{ day2_stale_osds }}"
+          changed_when: true
+          failed_when: false
+
+        - name: Mark the OSDs out
+          ansible.builtin.command:
+            argv: "{{ day2_ceph_cli + ['osd', 'out', 'osd.' ~ item] }}"
+          loop: "{{ day2_stale_osds }}"
+          changed_when: true
+
+        - name: Purge the OSDs from the Ceph cluster
+          ansible.builtin.command:
+            argv: "{{ day2_ceph_cli + ['osd', 'purge', item | string, '--yes-i-really-mean-it'] }}"
+          loop: "{{ day2_stale_osds }}"
+          register: day2_osd_purge
+          until: day2_osd_purge.rc == 0
+          retries: 6
+          delay: 10
+          changed_when: true
+
+        # The host bucket keeps the "noout" flag Rook set while draining, even once empty.
+        - name: Remove the host bucket of the node from the CRUSH map
+          when: day2_bucket_found | bool
+          ansible.builtin.command:
+            argv: "{{ day2_ceph_cli + ['osd', 'crush', 'rm', day2_crush_host] }}"
+          register: day2_crush_rm
+          changed_when: true
+          failed_when: false
+
+        - name: Delete the OSD deployments of the removed node
+          ansible.builtin.command:
+            argv: "{{ day2_kubectl + ['-n', day2_ceph_ns, 'delete', 'deployment', 'rook-ceph-osd-' ~ item, '--ignore-not-found'] }}"
+          loop: "{{ day2_stale_osds }}"
+          changed_when: true
+
+        # A deployment Rook created for an OSD that never joined the cluster is not in
+        # the CRUSH map; it is found by the host label Rook puts on every OSD.
+        - name: Delete any other OSD deployment Rook placed on the removed node
+          ansible.builtin.command:
+            argv: "{{ day2_kubectl + ['-n', day2_ceph_ns, 'delete', 'deployment', '-l',
+                                      'app=rook-ceph-osd,topology-location-host=' ~ day2_crush_host, '--ignore-not-found'] }}"
+          register: day2_osd_orphans
+          changed_when: day2_osd_orphans.stdout | length > 0
+
+        - name: Register the Ceph OSD purge
+          vars:
+            day2_purge_text: >-
+              {{ ('OSD ' ~ (day2_stale_osds | join(', ')) ~ ' purged; Ceph rebalances on the remaining workers')
+                 if day2_stale_osds | length > 0 else 'no down OSD in host bucket ' ~ day2_crush_host }}
+            day2_crush_text: >-
+              {{ 'host bucket removed from the CRUSH map' if (day2_crush_rm.rc | default(1)) == 0
+                 else 'host bucket NOT removed from the CRUSH map (' ~ (day2_crush_rm.stderr | default('') | trim)
+                      ~ '): run ceph osd crush rm ' ~ day2_crush_host ~ ' by hand' }}
+          ansible.builtin.set_fact:
+            day2_ceph_purge: >-
+              {{ (day2_purge_text ~ '; ' ~ day2_crush_text if day2_bucket_found | bool
+                  else 'no host bucket named ' ~ day2_crush_host ~ ' in ceph osd tree: check it by hand')
+                 ~ day2_ceph_other_clusters }}
+      rescue:
+        - name: Register the failed Ceph OSD purge
+          ansible.builtin.set_fact:
+            day2_ceph_purge: >-
+              NOT DONE ({{ ansible_failed_task.name }}:
+              {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('see task output above')) | trim }}).
+              Check the OSD tree from the rook-ceph-tools deployment in namespace {{ day2_ceph_ns }} (ceph osd tree); purge a
+              down OSD by hand: ceph osd out osd.<id>; ceph osd purge <id> --yes-i-really-mean-it; ceph osd crush rm
+              {{ day2_crush_host }}; then delete the deployment rook-ceph-osd-<id>
+
+    - name: Register why no Ceph OSD purge was attempted
+      when: day2_ceph_purge is not defined
+      ansible.builtin.set_fact:
+        day2_ceph_purge: >-
+          {{ 'not applicable (Rook Ceph is not installed)' if day2_ceph_ns | length == 0
+             else ('not attempted (cleanup_only without the node name): re-run with --name <node> --cleanup-only --ip '
+                   ~ day2_node_ip ~ ', or purge the down OSD by hand from the rook-ceph-tools deployment '
+                   ~ '(ceph osd tree; ceph osd out osd.<id>; ceph osd purge <id> --yes-i-really-mean-it; ceph osd crush rm <host>)'
+                   if day2_ceph_node_name | length == 0
+                   else ('not attempted: no rook-ceph-tools deployment in namespace ' ~ day2_ceph_ns
+                         ~ '; enable the toolbox in the rook-ceph-cluster values or run the ceph commands from a mon pod'
+                         if day2_ceph_toolbox.stdout | default('') | trim | length == 0
+                         else 'not attempted')) }}
+
+    # ------------------------------------------------------------------------
+    # Both modes: drop the IP from the CAPI inventory, hand the host to the cleanup play
+    # ------------------------------------------------------------------------
+    - name: Remove the IP from spec.hosts of the PreprovisionedInventory
+      ansible.builtin.command:
+        argv: >-
+          {{ day2_kubectl + ['patch', 'preprovisionedinventory', item.metadata.name, '-n', item.metadata.namespace,
+                             '--type=json', '-p', day2_patch | to_json] }}
+      vars:
+        day2_host_index: "{{ (item.spec.hosts | map(attribute='address') | list).index(day2_node_ip) }}"
+        day2_patch:
+          - op: test
+            path: "/spec/hosts/{{ day2_host_index }}/address"
+            value: "{{ day2_node_ip }}"
+          - op: remove
+            path: "/spec/hosts/{{ day2_host_index }}"
+      loop: "{{ (day2_inventories_raw.stdout | from_json)['items'] }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+      when:
+        - (item.metadata.labels | default({}))['cluster.x-k8s.io/cluster-name'] | default(cluster_name) == cluster_name
+        - day2_node_ip in (item.spec.hosts | default([]) | map(attribute='address') | list)
+      register: day2_inventory_patch
+      changed_when: true
+
+    - name: Register inventory host matching the removed IP
+      ansible.builtin.set_fact:
+        day2_inventory_host: >-
+          {{ groups['workers'] | default([]) | map('extract', hostvars) | selectattr('ansible_host', 'defined')
+             | selectattr('ansible_host', 'equalto', day2_node_ip) | map(attribute='inventory_hostname') | list | first | default('') }}
+
+    # cleanup_only: a host is known when it is a worker of inventory.ini or was
+    # listed in a PreprovisionedInventory of this cluster. Anything else must
+    # show traces of this cluster on its disk, or be forced (see the next play).
+    - name: Register whether the host is known to this cluster
+      ansible.builtin.set_fact:
+        day2_host_known: >-
+          {{ day2_inventory_host | length > 0
+             or (day2_inventory_patch.results | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0) }}
+
+    # The host is reached by its real IP with the SSH user of the nodes, not the jump host user.
+    - name: Add the host for OS cleanup
+      ansible.builtin.add_host:
+        name: "{{ day2_inventory_host if day2_inventory_host | length > 0 else 'decommissioned-' ~ day2_node_ip }}"
+        ansible_host: "{{ day2_node_ip }}"
+        ansible_user: >-
+          {{ hostvars[day2_inventory_host]['ansible_user'] if day2_inventory_host | length > 0
+             else hostvars[(groups['workers'] | default([]) + groups['control_plane'])[0]]['ansible_user'] }}
+        groups: decommissioned_node
+
+# Role "common" supplies the defaults of the disk layout variables (ceph_osd_device,
+# local_volume_*) when inventory.ini does not set them, and resolves the configured
+# values to the kernel names of the disks on this host (tasks/data_disks.yml).
+- name: Clean up the operating system of the removed worker
+  hosts: decommissioned_node
+  gather_facts: false
+  become: true
+  vars:
+    day2_ceph_image: "{{ storage_network_ceph_image_path | default('/var/lib/ceph-osd.img') }}"
+    day2_ceph_osd_device: "{{ ceph_osd_device }}"
+    day2_local_volume_devices: "{{ local_volume_devices }}"
+    # Configured values as paths, for messages (a kernel name is shown as /dev/<name>).
+    day2_data_disk_paths: >-
+      {{ (([day2_ceph_osd_device] if day2_ceph_osd_device | length > 0 else []) + day2_local_volume_devices)
+         | map('regex_replace', '^(?=[^/])', '/dev/') | list }}
+    # Kernel names the values resolved to on this host (set by the resolution task below).
+    day2_ceph_disk: "{{ common_data_disks | default([]) | selectattr('kind', 'equalto', 'ceph') | map(attribute='name') | first | default('') }}"
+    day2_volume_disks: "{{ common_data_disks | default([]) | selectattr('kind', 'equalto', 'volume') | list }}"
+    day2_ceph_unit: /etc/systemd/system/attach-ceph-loop.service
+    day2_kubelet_conf: /etc/kubernetes/kubelet.conf
+    day2_cleanup_only: "{{ cleanup_only | default(false) | bool }}"
+    day2_cleanup_force: "{{ cleanup_force | default(false) | bool }}"
+    day2_host_known: "{{ hostvars[groups['jump_host'][0]]['day2_host_known'] | default(false) | bool }}"
+  roles:
+    - role: common
+  tasks:
+    - name: Reach the host and read which cluster it belongs to
+      block:
+        # A failure here is rescued and reported; an unreachable host would instead abort the whole playbook.
+        - name: Wait for SSH and sudo on the host
+          ansible.builtin.wait_for_connection:
+            timeout: 60
+
+        - name: Check for a kubelet configuration
+          ansible.builtin.stat:
+            path: "{{ day2_kubelet_conf }}"
+          register: day2_kubelet_conf_stat
+
+        - name: Read the kubelet configuration
+          when: day2_kubelet_conf_stat.stat.exists
+          ansible.builtin.slurp:
+            src: "{{ day2_kubelet_conf }}"
+          register: day2_kubelet_conf_raw
+
+        - name: Check Ceph loop device unit
+          ansible.builtin.stat:
+            path: "{{ day2_ceph_unit }}"
+          register: day2_ceph_unit_stat
+
+        # member  : kubelet configured for the API endpoint of this cluster
+        # foreign : kubelet configured for another API endpoint
+        # known   : no kubelet configuration, but the host is in the inventories or carries the Ceph loop unit
+        # unknown : nothing links the host to this cluster
+        - name: Classify the host
+          ansible.builtin.set_fact:
+            day2_host_verdict: >-
+              {{ ('member' if (day2_kubelet_conf_raw.content | b64decode)
+                               is search('server:\s*https://' ~ (control_plane_vip | regex_escape) ~ '[:/]')
+                  else 'foreign')
+                 if day2_kubelet_conf_stat.stat.exists
+                 else ('known' if (day2_host_known or day2_ceph_unit_stat.stat.exists) else 'unknown') }}
+      rescue:
+        - name: Register failed OS cleanup
+          ansible.builtin.set_fact:
+            day2_os_cleanup_ok: false
+            day2_os_cleanup_error: >-
+              {{ ansible_failed_task.name }}:
+              {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('see task output above')) }}
+
+    # Outside the block on purpose: this failure ends the playbook, so the
+    # inventory.ini line of the host is not removed either.
+    - name: Refuse to clean up a host that is not a former member of this cluster (cleanup_only)
+      when:
+        - day2_cleanup_only
+        - day2_os_cleanup_ok is not defined
+        - day2_host_verdict in ['foreign', 'unknown']
+        - not day2_cleanup_force
+      ansible.builtin.fail:
+        msg: >-
+          Refusing OS cleanup of {{ ansible_host }}:
+          {{ 'its kubelet is configured for another Kubernetes API endpoint than ' ~ control_plane_vip
+             ~ ' (' ~ day2_kubelet_conf ~ '): it looks like a member of another cluster.'
+             if day2_host_verdict == 'foreign'
+             else 'it is not a worker of inventory.ini, was not listed in a PreprovisionedInventory of cluster '
+                  ~ cluster_name ~ ' and carries no trace of it (no ' ~ day2_kubelet_conf ~ ', no Ceph loop unit).' }}
+          The cleanup runs "kubeadm reset --force" and deletes the Kubernetes, CNI and Ceph
+          {{ 'directories, and wipes the Ceph signature from ' ~ (day2_data_disk_paths | first)
+             if day2_ceph_osd_device | length > 0 else 'directories' }}{{
+             ', and unmounts and wipes the local volume devices ('
+             ~ (day2_data_disk_paths[(1 if day2_ceph_osd_device | length > 0 else 0):] | join(', ')) ~ ').'
+             if day2_local_volume_devices | length > 0 else '.' }}
+          If this really is the host to clean, repeat the command with --force (cleanup_force=true).
+          The host was not modified; if its address was listed in a PreprovisionedInventory of this cluster,
+          that entry has already been removed.
+
+    - name: Clean up Kubernetes and Ceph leftovers
+      when: day2_os_cleanup_ok is not defined
+      block:
+        # Before anything is changed: every configured value must resolve to a
+        # whole disk of its own on this host, none of them the disk holding /.
+        # Otherwise the cleanup stops here and the report says why.
+        - name: Resolve the data disks of the host
+          when: day2_ceph_osd_device | length > 0 or day2_local_volume_devices | length > 0
+          ansible.builtin.include_role:
+            name: common
+            tasks_from: data_disks
+
+        - name: Locate kubeadm
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - /usr/bin/kubeadm
+            - /usr/local/bin/kubeadm
+          register: day2_kubeadm_stat
+
+        - name: Reset kubeadm state
+          when: day2_kubeadm_paths | length > 0
+          ansible.builtin.command:
+            argv:
+              - "{{ day2_kubeadm_paths | first }}"
+              - reset
+              - --force
+          vars:
+            day2_kubeadm_paths: "{{ day2_kubeadm_stat.results | selectattr('stat.exists') | map(attribute='item') | list }}"
+          changed_when: true
+
+        - name: Stop and disable the Ceph loop device unit
+          when: day2_ceph_unit_stat.stat.exists
+          ansible.builtin.systemd:
+            name: attach-ceph-loop.service
+            state: stopped
+            enabled: false
+
+        - name: Check Ceph OSD image file
+          ansible.builtin.stat:
+            path: "{{ day2_ceph_image }}"
+          register: day2_ceph_image_stat
+
+        - name: List loop devices backed by the Ceph OSD image
+          when: day2_ceph_image_stat.stat.exists
+          ansible.builtin.command:
+            argv: ['losetup', '-j', "{{ day2_ceph_image }}"]
+          register: day2_loop_list
+          changed_when: false
+
+        - name: Detach loop devices backed by the Ceph OSD image
+          ansible.builtin.command:
+            argv: ['losetup', '-d', "{{ item.split(':')[0] }}"]
+          loop: "{{ day2_loop_list.stdout_lines | default([]) }}"
+          changed_when: true
+
+        # Rook reuses a disk that still carries any copy of the old BlueStore label,
+        # and the stale OSD then fails to start. Ceph 19 writes label copies at
+        # 0, 1, 10, 100 and 1000 GiB, so wipefs alone is not enough: every copy that
+        # fits on the disk is zeroed (seen on a lab worker). Only a whole disk without
+        # partitions that is blank or carries a Ceph signature is touched.
+        - name: Read the raw OSD disk
+          when: day2_ceph_osd_device | length > 0
+          ansible.builtin.command:
+            argv: ['lsblk', '-n', '-o', 'NAME,TYPE,FSTYPE', "/dev/{{ day2_ceph_disk }}"]
+          register: day2_osd_lsblk
+          changed_when: false
+          failed_when: false
+
+        - name: Wipe the Ceph signature from the raw OSD disk
+          when:
+            - day2_ceph_osd_device | length > 0
+            - day2_osd_lsblk.rc == 0
+            - day2_osd_lsblk.stdout_lines | length == 1
+            - day2_osd_fields | length >= 2
+            - day2_osd_fields[1] == 'disk'
+            - day2_osd_fields | length == 2 or day2_osd_fields[2] == 'ceph_bluestore'
+          vars:
+            day2_osd_fields: "{{ (day2_osd_lsblk.stdout_lines | default(['']) | first | default('')).split() }}"
+          ansible.builtin.command:
+            argv: ['wipefs', '--all', "/dev/{{ day2_ceph_disk }}"]
+          register: day2_osd_wipe
+          changed_when: day2_osd_wipe.stdout | length > 0
+
+        - name: Zero every BlueStore label copy on the raw OSD disk
+          when: day2_osd_wipe is not skipped
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              dev="/dev/{{ day2_ceph_disk }}"
+              size_mib=$(( $(blockdev --getsize64 "$dev") / 1048576 ))
+              for off in 0 1024 10240 102400 1024000; do
+                if [ "$off" -lt "$size_mib" ]; then
+                  dd if=/dev/zero of="$dev" bs=1M count=1 seek="$off" oflag=direct conv=notrunc status=none
+                fi
+              done
+          changed_when: true
+
+        - name: Register the outcome of the raw OSD disk wipe
+          when: day2_ceph_osd_device | length > 0
+          vars:
+            day2_ceph_label: "{{ day2_data_disk_paths | first }} (/dev/{{ day2_ceph_disk }})"
+          ansible.builtin.set_fact:
+            day2_osd_wipe_outcome: >-
+              {{ ('signature wiped from ' ~ day2_ceph_label if day2_osd_wipe.stdout | default('') | length > 0
+                  else 'no signature on ' ~ day2_ceph_label)
+                 if day2_osd_wipe is not skipped
+                 else 'NOT wiped: ' ~ day2_ceph_label ~ ' is missing, partitioned or carries a non-Ceph signature (lsblk: '
+                      ~ ((day2_osd_lsblk.stdout | default('')) ~ ' ' ~ (day2_osd_lsblk.stderr | default(''))) | trim ~ ')' }}
+
+        # Same rules as the OSD disk: only a whole disk without partitions that
+        # carries the toolkit's file system, mounted at its own mount point or
+        # not at all, is unmounted (fstab line dropped) and wiped. Anything else
+        # is left alone and reported. A host that rejoins gets fresh volumes.
+        # Volume N is the N-th entry of local_volume_devices, whatever its kernel name.
+        - name: Read the local volume devices
+          ansible.builtin.command:
+            argv: ['lsblk', '-J', '-b', '-o', 'NAME,TYPE,FSTYPE,PTTYPE,MOUNTPOINT', "/dev/{{ item.name }}"]
+          loop: "{{ day2_volume_disks }}"
+          loop_control:
+            label: "{{ item.value }} (/dev/{{ item.name }}, {{ local_volume_mount_prefix }}{{ item.volume }})"
+          register: day2_volume_lsblk
+          changed_when: false
+          failed_when: false
+
+        - name: Select the local volume devices that carry the toolkit's file system
+          vars:
+            day2_volume_info: "{{ ((item.stdout | default('') or '{}') | from_json).blockdevices | default([{}]) | first | default({}) }}"
+            day2_volume_path: "{{ local_volume_mount_prefix }}{{ item.item.volume }}"
+            day2_volume_label: "{{ item.item.value }} (/dev/{{ item.item.name }})"
+            day2_volume_eligible: >-
+              {{ item.rc | default(1) == 0
+                 and day2_volume_info.type | default('') == 'disk'
+                 and day2_volume_info.children | default([]) | length == 0
+                 and day2_volume_info.pttype | default('', true) | length == 0
+                 and day2_volume_info.fstype | default('', true) == local_volume_fstype
+                 and day2_volume_info.mountpoint | default('', true) in ['', day2_volume_path] }}
+          ansible.builtin.set_fact:
+            day2_volumes_to_wipe: >-
+              {{ day2_volumes_to_wipe | default([])
+                 + ([{'device': item.item.name, 'label': day2_volume_label, 'path': day2_volume_path}]
+                    if day2_volume_eligible | bool else []) }}
+            day2_volumes_skipped: >-
+              {{ day2_volumes_skipped | default([])
+                 + ([] if day2_volume_eligible | bool
+                    else [day2_volume_label ~ ' NOT wiped: missing, partitioned, mounted elsewhere or without a '
+                          ~ local_volume_fstype ~ ' file system (lsblk: '
+                          ~ ((item.stdout | default('')) ~ ' ' ~ (item.stderr | default(''))) | trim ~ ')']) }}
+          loop: "{{ day2_volume_lsblk.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item.value }} (/dev/{{ item.item.name }})"
+
+        # "absent" only acts on a mount point listed in fstab: "unmounted" first
+        # covers a volume that was mounted by hand.
+        - name: Unmount the local volumes
+          ansible.posix.mount:
+            path: "{{ item.path }}"
+            state: unmounted
+          loop: "{{ day2_volumes_to_wipe | default([]) }}"
+          loop_control:
+            label: "{{ item.path }} ({{ item.label }})"
+
+        - name: Remove the local volumes from /etc/fstab
+          ansible.posix.mount:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ day2_volumes_to_wipe | default([]) }}"
+          loop_control:
+            label: "{{ item.path }} ({{ item.label }})"
+
+        - name: Wipe the file system signature from the local volume devices
+          ansible.builtin.command:
+            argv: ['wipefs', '--all', "/dev/{{ item.device }}"]
+          loop: "{{ day2_volumes_to_wipe | default([]) }}"
+          loop_control:
+            label: "{{ item.label }}"
+          changed_when: true
+
+        - name: Register the outcome of the local volume cleanup
+          ansible.builtin.set_fact:
+            day2_volume_outcome: >-
+              {{ (day2_volumes_to_wipe | default([]) | map(attribute='label') | map('regex_replace', '^', 'unmounted and wiped ') | list
+                  + day2_volumes_skipped | default([])) | join('; ') }}
+
+        - name: Remove Ceph, Rook, CNI and Kubernetes leftovers
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ day2_ceph_unit }}"
+            - "{{ day2_ceph_image }}"
+            - /var/lib/rook
+            - /etc/cni/net.d
+            - /var/lib/cni
+            - /etc/kubernetes
+            - /var/lib/kubelet
+
+        - name: Reload systemd after removing the loop device unit
+          when: day2_ceph_unit_stat.stat.exists
+          ansible.builtin.systemd:
+            daemon_reload: true
+
+        - name: Reboot the host to release loop devices, CNI interfaces and firewall rules
+          when: reboot_after_cleanup | default(false) | bool
+          ansible.builtin.reboot:
+            reboot_timeout: 600
+
+        - name: Register successful OS cleanup
+          ansible.builtin.set_fact:
+            day2_os_cleanup_ok: true
+      rescue:
+        - name: Register failed OS cleanup
+          ansible.builtin.set_fact:
+            day2_os_cleanup_ok: false
+            day2_os_cleanup_error: >-
+              {{ ansible_failed_task.name }}:
+              {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('see task output above')) }}
+
+- name: Update inventory.ini and report the real outcome
+  hosts: jump_host
+  gather_facts: false
+  become: false
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  vars:
+    day2_kubectl: ['kubectl', '--kubeconfig', "{{ cluster_kubeconfig }}"]
+    day2_cleanup_host: "{{ hostvars[groups['decommissioned_node'][0]] }}"
+    day2_os_ok: "{{ day2_cleanup_host.day2_os_cleanup_ok | default(false) | bool }}"
+    day2_rebooted: "{{ reboot_after_cleanup | default(false) | bool }}"
+    day2_os_error: "{{ day2_cleanup_host.day2_os_cleanup_error | default('host unreachable or cleanup not started') }}"
+    day2_inventory_patched: "{{ day2_inventory_patch.results | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0 }}"
+    day2_reboot_hint: >-
+      Reboot the host before reusing it: CNI interfaces, kube-proxy/CNI firewall rules and busy loop devices
+      are only released by a reboot.
+    day2_osd_wipe: >-
+      {{ day2_cleanup_host.day2_osd_wipe_outcome
+         | default('not applicable (loop device mode)' if ceph_osd_device | length == 0
+                   else 'not done (the cleanup stopped earlier)') }}
+    day2_volume_wipe: >-
+      {{ day2_cleanup_host.day2_volume_outcome
+         | default('not applicable (directory shortcut, local_volume_devices is empty)' if local_volume_devices | length == 0
+                   else 'not done (the cleanup stopped earlier)') }}
+  roles:
+    - role: common
+  tasks:
+    - name: Remove the host line from inventory.ini
+      when:
+        - day2_inventory_host | length > 0
+        - inventory_file is defined
+        - inventory_file is match('.*\.ini$')
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: "{{ inventory_file }}"
+        regexp: "{{ '^' ~ (day2_inventory_host | regex_escape) ~ '\\s' }}"
+        state: absent
+      register: day2_inventory_persist
+
+    - name: Retrieve updated cluster node list
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'nodes', '-o', 'wide'] }}"
+      register: day2_nodes_list
+      changed_when: false
+
+    - name: Report outcome
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================================="
+          - "{{ 'WORKER REMOVED AND HOST CLEANED UP' if day2_os_ok else 'WORKER REMOVAL INCOMPLETE - HOST OS CLEANUP FAILED' }}"
+          - "=============================================================================="
+          - "Node / IP             : {{ day2_node_name }} / {{ day2_node_ip }}"
+          - "Cluster API removal   : {{ 'done' if day2_cluster_removal_done else 'skipped (cleanup_only), node was not in the cluster' }}"
+          - "CAPI inventory        : {{ 'IP removed' if day2_inventory_patched else 'IP was not listed' }}"
+          - "Host OS cleanup       : {{ 'done' if day2_os_ok else 'FAILED - ' ~ day2_os_error }}"
+          - "Ceph OSD disk         : {{ day2_osd_wipe }}"
+          - "Local volume devices  : {{ day2_volume_wipe }}"
+          - "inventory.ini         : {{ 'host line removed' if day2_inventory_persist is changed else 'no host line removed' }}"
+          - "{{ 'Host rebooted.' if (day2_os_ok and day2_rebooted) else day2_reboot_hint }}"
+          - "Rook Ceph OSD         : {{ day2_ceph_purge | default('not checked') }}"
+          - "{{ day2_nodes_list.stdout_lines }}"
+          - "=============================================================================="
+
+    - name: Fail when the host OS cleanup did not complete
+      when: not day2_os_ok
+      ansible.builtin.fail:
+        msg: >-
+          The host {{ day2_node_ip }} was not cleaned up. Fix the cause and re-run only the OS cleanup with:
+          ./scripts/remove-node.sh --cleanup-only --ip {{ day2_node_ip }}
+          (add --force if the command no longer recognises the host as a former member of this cluster).

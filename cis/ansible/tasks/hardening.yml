@@ -1,0 +1,412 @@
+---
+# CIS Level 1 aligned baseline (subset of controls) - hardening tasks.
+# Included by cis_hardening.yml and by Stage 2.5 of ansible/site.yml. The
+# including play must load role "common" and define the handlers
+# "Restart sshd daemon" and "Reload augenrules".
+
+- name: Load the CIS baseline definitions
+  ansible.builtin.include_vars:
+    file: ../vars/baseline.yml
+
+- name: Verify the prerequisites of the CIS baseline
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] in ['RedHat', 'Debian']
+      - cis_login_user | length > 0
+      - cis_login_user != 'root'
+      - cis_extra_trusted_list is sequence
+      - cis_extra_trusted_list is not string
+      - not (cis_is_k8s_node | bool) or node_subnet_cidr | default('') is match('^[0-9.]+/[0-9]+$')
+      - not (cis_is_k8s_node | bool) or pod_cidr | default('') is match('^[0-9.]+/[0-9]+$')
+    fail_msg: >-
+      Unsupported setup: the OS family must be RedHat or Debian, the SSH login
+      user ('{{ cis_login_user }}') must not be root (the baseline sets
+      PermitRootLogin no), node_subnet_cidr / pod_cidr must be valid IPv4 CIDRs
+      (they come from role "common" and can be overridden in the inventory),
+      and cis_extra_trusted_cidrs must be a list (with -e use JSON).
+    quiet: true
+  vars:
+    # ansible_user, else remote_user from the configuration or -u, else the
+    # local user name, which is what ssh uses when nothing is set.
+    cis_login_user: >-
+      {{ ansible_user
+         | default(lookup('ansible.builtin.config', 'DEFAULT_REMOTE_USER'), true)
+         | default(lookup('ansible.builtin.env', 'USER'), true)
+         | default('', true) }}
+
+# ------------------------------------------------------------------------------
+# 1. Unused filesystem kernel modules
+# ------------------------------------------------------------------------------
+- name: Disable unused filesystem kernel modules
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/60-cis-filesystems.conf
+    content: |
+      {% for module in cis_fs_modules %}
+      install {{ module }} /bin/false
+      blacklist {{ module }}
+      {% endfor %}
+    owner: root
+    group: root
+    mode: '0644'
+
+# ------------------------------------------------------------------------------
+# 2. Kernel parameters (sysctl)
+# ------------------------------------------------------------------------------
+- name: Configure the kernel modules required by Kubernetes
+  when: cis_is_k8s_node | bool
+  block:
+    - name: Persist the Kubernetes kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/60-cis-k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Load the Kubernetes kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+# apport sets fs.suid_dumpable back to 2 every time it starts.
+- name: Check whether apport is installed (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  ansible.builtin.stat:
+    path: /etc/default/apport
+  register: cis_apport_defaults
+
+- name: Disable apport crash reporting (Debian / Ubuntu)
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - cis_apport_defaults.stat.exists
+  block:
+    - name: Disable apport in its defaults file
+      ansible.builtin.lineinfile:
+        path: /etc/default/apport
+        regexp: '^enabled='
+        line: 'enabled=0'
+
+    - name: Stop and disable the apport service
+      ansible.builtin.systemd:
+        name: apport.service
+        state: stopped
+        enabled: false
+
+- name: Apply sysctl settings
+  ansible.posix.sysctl:
+    name: "{{ item.split('=')[0] }}"
+    value: "{{ item.split('=')[1] }}"
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/60-cis.conf
+  loop: "{{ cis_sysctl_settings }}"
+
+# ------------------------------------------------------------------------------
+# 3. Auditing, time synchronization and cron packages
+# ------------------------------------------------------------------------------
+- name: Install baseline packages (RedHat / Rocky)
+  when: ansible_facts['os_family'] == 'RedHat'
+  ansible.builtin.dnf:
+    name: "{{ cis_packages }}"
+    state: present
+
+- name: Install baseline packages (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  ansible.builtin.apt:
+    name: "{{ cis_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure auditd, chrony and cron are enabled and running
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: "{{ cis_services }}"
+
+# ------------------------------------------------------------------------------
+# 4. auditd rules
+# ------------------------------------------------------------------------------
+- name: Configure auditd rules
+  ansible.builtin.copy:
+    dest: /etc/audit/rules.d/50-cis.rules
+    content: |
+      ## Date and time changes
+      -a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time-change
+      -a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime,stime -k time-change
+      -w /etc/localtime -p wa -k time-change
+
+      ## User and group identity
+      -w /etc/group -p wa -k identity
+      -w /etc/passwd -p wa -k identity
+      -w /etc/gshadow -p wa -k identity
+      -w /etc/shadow -p wa -k identity
+      -w /etc/security/opasswd -p wa -k identity
+
+      ## Network environment
+      -w /etc/issue -p wa -k system-locale
+      -w /etc/issue.net -p wa -k system-locale
+      -w /etc/hosts -p wa -k system-locale
+
+      ## Sudoers
+      -w /etc/sudoers -p wa -k scope
+      -w /etc/sudoers.d/ -p wa -k scope
+
+      ## Kernel module loading and unloading
+      -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
+      -a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules
+    owner: root
+    group: root
+    mode: '0600'
+  notify: Reload augenrules
+
+# ------------------------------------------------------------------------------
+# 5. Identity file and cron permissions
+# ------------------------------------------------------------------------------
+- name: Set ownership and permissions on identity files and cron paths
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cis_file_permissions }}"
+  loop_control:
+    label: "{{ item.path }} ({{ item.mode }} root:{{ item.group }})"
+
+# ------------------------------------------------------------------------------
+# 6. Account and password defaults
+# ------------------------------------------------------------------------------
+- name: Configure default umask 027 for login shells
+  ansible.builtin.copy:
+    dest: /etc/profile.d/60-cis-umask.sh
+    content: "umask 027\n"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Read the defaults for new user accounts
+  ansible.builtin.command:
+    cmd: useradd -D
+  register: cis_useradd_defaults
+  changed_when: false
+
+# Applies to accounts created later; existing accounts are left untouched.
+- name: Lock new accounts 30 days after password expiry
+  when: "'INACTIVE=30' not in cis_useradd_defaults.stdout_lines"
+  ansible.builtin.command:
+    cmd: useradd -D -f 30
+  changed_when: true
+
+- name: Configure password quality requirements
+  ansible.builtin.copy:
+    dest: /etc/security/pwquality.conf
+    content: |
+      minlen = 14
+      dcredit = -1
+      ucredit = -1
+      lcredit = -1
+      ocredit = -1
+    owner: root
+    group: root
+    mode: '0644'
+
+# ------------------------------------------------------------------------------
+# 7. Login warning banners
+# ------------------------------------------------------------------------------
+- name: Configure login warning banners
+  ansible.builtin.copy:
+    dest: "{{ item }}"
+    content: |
+      ************************************************************************************
+      * AUTHORIZED ACCESS ONLY. ALL SESSIONS AND ACTIVITIES ARE MONITORED AND AUDITED.   *
+      * DISCONNECT IMMEDIATELY IF YOU ARE NOT AN AUTHORIZED USER.                        *
+      ************************************************************************************
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ cis_banner_files }}"
+
+# ------------------------------------------------------------------------------
+# 8. OpenSSH daemon
+# ------------------------------------------------------------------------------
+- name: Remove the sshd drop-in written by earlier versions of this baseline
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d/50-cis.conf
+    state: absent
+  notify: Restart sshd daemon
+
+- name: Configure the OpenSSH daemon drop-in
+  ansible.builtin.copy:
+    dest: "{{ cis_sshd_dropin }}"
+    content: "{{ cis_sshd_settings | join('\n') }}\n"
+    owner: root
+    group: root
+    mode: '0600'
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Restart sshd daemon
+
+# A broken configuration stops the play here, before the handler restarts sshd.
+- name: Validate the complete OpenSSH daemon configuration
+  ansible.builtin.command:
+    cmd: /usr/sbin/sshd -t
+  changed_when: false
+
+# ------------------------------------------------------------------------------
+# 9. Host firewall
+# Hosts that are not cluster nodes (the jump host): default deny inbound, SSH
+# allowed. Cluster nodes: nothing is installed or enabled unless the inventory
+# opts in (cis_firewalld_on_nodes / cis_ufw_on_nodes), because the NKP guide
+# requires firewalld to be disabled on pre-provisioned machines. With the
+# opt-in, nodes additionally trust the node subnet and the Pod CIDR and allow
+# forwarded (pod) traffic.
+# ------------------------------------------------------------------------------
+- name: Report that the host firewall is not managed on this cluster node
+  when: not (cis_firewall_managed | bool)
+  ansible.builtin.debug:
+    msg: >-
+      Control 9 (host firewall) is not applied on cluster node {{ inventory_hostname }} by design:
+      the NKP guide requires firewalld to be disabled on pre-provisioned machines. A firewall that is
+      already active is left as it is. Opt in with
+      {{ 'cis_firewalld_on_nodes' if ansible_facts['os_family'] == 'RedHat' else 'cis_ufw_on_nodes' }}=true
+      (outside the vendor prerequisites, see cis/README.md).
+
+# The rules are written before the service is started (offline: true edits the
+# on-disk configuration while firewalld is stopped), so a host never runs with
+# the firewall up and the trusted sources still missing.
+- name: Configure firewalld (RedHat / Rocky)
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - cis_firewall_managed | bool
+  block:
+    - name: Allow SSH in firewalld
+      ansible.posix.firewalld:
+        service: ssh
+        permanent: true
+        immediate: true
+        offline: true
+        state: enabled
+
+    # The default zone of Rocky also allows cockpit and dhcpv6-client.
+    - name: Remove the services firewalld allows by default besides SSH
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        permanent: true
+        immediate: true
+        offline: true
+        state: disabled
+      loop: "{{ cis_firewalld_default_services_to_remove }}"
+
+    - name: Allow the SSH port used by Ansible in firewalld
+      when: cis_ssh_port | int != 22
+      ansible.posix.firewalld:
+        port: "{{ cis_ssh_port }}/tcp"
+        permanent: true
+        immediate: true
+        offline: true
+        state: enabled
+
+    - name: Trust the node subnet and the Pod CIDR in firewalld
+      when: cis_is_k8s_node | bool
+      ansible.posix.firewalld:
+        source: "{{ item }}"
+        zone: trusted
+        permanent: true
+        immediate: true
+        offline: true
+        state: enabled
+      loop: "{{ cis_firewall_trusted_sources }}"
+
+    # Explicit state: node_firewalld_masquerade=false turns masquerading off
+    # on a node where an earlier run enabled it.
+    - name: Set masquerading in the default firewalld zone
+      when: cis_is_k8s_node | bool
+      ansible.posix.firewalld:
+        masquerade: true
+        permanent: true
+        immediate: true
+        offline: true
+        state: "{{ 'enabled' if node_firewalld_masquerade | default(true) | bool else 'disabled' }}"
+
+    - name: Ensure firewalld is enabled and running
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+      register: cis_firewalld_start
+
+    # Docker registers its own firewalld zone only when it starts after firewalld.
+    - name: Collect service state after the first firewalld start
+      when:
+        - cis_firewalld_start is changed
+        - not (cis_is_k8s_node | bool)
+      ansible.builtin.service_facts:
+
+    - name: Restart Docker after the first firewalld start
+      when:
+        - cis_firewalld_start is changed
+        - not (cis_is_k8s_node | bool)
+        - (ansible_facts.services['docker.service'] | default({})).state | default('') == 'running'
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+
+# UFW applies /etc/ufw/sysctl.conf every time it starts, also when it was
+# enabled outside this baseline, so the file is aligned wherever it exists.
+- name: Check for the UFW sysctl file (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  ansible.builtin.stat:
+    path: /etc/ufw/sysctl.conf
+  register: cis_ufw_sysctl_file
+
+- name: Align the sysctl values that UFW applies at start
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - cis_ufw_sysctl_file.stat.exists
+  ansible.builtin.lineinfile:
+    path: /etc/ufw/sysctl.conf
+    regexp: "^#?\\s*{{ item.split('=')[0] | replace('.', '/') | regex_escape }}="
+    line: "{{ item.split('=')[0] | replace('.', '/') }}={{ item.split('=')[1] }}"
+  loop: "{{ cis_ufw_sysctl_settings }}"
+
+- name: Configure UFW (Debian / Ubuntu)
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - cis_firewall_managed | bool
+  block:
+    - name: Allow routed traffic in UFW for pod networking
+      when: cis_is_k8s_node | bool
+      community.general.ufw:
+        direction: routed
+        default: allow
+
+    - name: Allow SSH in UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ cis_ssh_port }}"
+        proto: tcp
+
+    - name: Allow the node subnet and the Pod CIDR in UFW
+      when: cis_is_k8s_node | bool
+      community.general.ufw:
+        rule: allow
+        from_ip: "{{ item }}"
+      loop: "{{ cis_firewall_trusted_sources }}"
+
+    - name: Deny other incoming traffic in UFW
+      community.general.ufw:
+        direction: incoming
+        default: deny
+
+    - name: Ensure UFW is enabled
+      community.general.ufw:
+        state: enabled
+
+# The audit may run right after these tasks in the same play.
+- name: Apply pending sshd and auditd changes
+  ansible.builtin.meta: flush_handlers
