@@ -1,0 +1,212 @@
+---
+# ==============================================================================
+# Role: cluster_deploy - NKP Preprovisioned Self-Managed Cluster Deployment
+# ==============================================================================
+
+- name: Create NKP working directory on Jump Host
+  ansible.builtin.file:
+    path: "{{ nkp_workdir }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+
+- name: Generate preprovisioned_inventory.yaml file
+  ansible.builtin.template:
+    src: preprovisioned_inventory.yaml.j2
+    dest: "{{ nkp_workdir }}/preprovisioned_inventory.yaml"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0644'
+
+# StrictHostKeyChecking=no: nodes are rebuilt often in lab use (see ansible.cfg).
+- name: Test SSH connectivity from Jump Host to Control Plane and Workers
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -o
+      - BatchMode=yes
+      - -o
+      - StrictHostKeyChecking=no
+      - -i
+      - "{{ cluster_ssh_key_path }}"
+      - "{{ cluster_ssh_user }}@{{ hostvars[item]['ansible_host'] }}"
+      - uptime
+  loop: "{{ groups['nkp_nodes'] }}"
+  loop_control:
+    label: "{{ item }} ({{ hostvars[item]['ansible_host'] }})"
+  become: false
+  changed_when: false
+
+- name: Check for existing cluster kubeconfig
+  ansible.builtin.stat:
+    path: "{{ cluster_kubeconfig }}"
+  register: cluster_deploy_kubeconfig
+
+# A kubeconfig alone does not prove the cluster is complete: nkp can fail after
+# writing it. The CAPI Cluster object lives on the workload cluster only after
+# the self-managed pivot, so its presence marks a finished "nkp create cluster".
+- name: Verify an existing kubeconfig belongs to a completed cluster
+  when:
+    - cluster_deploy_kubeconfig.stat.exists
+    - cluster_deploy_kubeconfig.stat.size > 0
+  become: false
+  block:
+    - name: Look up the Cluster API object on the workload cluster
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ cluster_kubeconfig }}"
+          - --request-timeout=30s
+          - --namespace
+          - default
+          - get
+          - clusters.cluster.x-k8s.io
+          - "{{ cluster_name }}"
+          - --output
+          - name
+      register: cluster_deploy_pivot_check
+      changed_when: false
+      until: cluster_deploy_pivot_check.rc == 0
+      retries: 3
+      delay: 10
+  rescue:
+    - name: Stop on an unreachable or partially created cluster
+      ansible.builtin.fail:
+        msg: >-
+          {{ cluster_kubeconfig }} exists, but the Cluster API object '{{ cluster_name }}' could not be
+          read through it ({{ cluster_deploy_pivot_check.stderr | default('no output') | trim }}).
+          Either the API server is unreachable or a previous 'nkp create cluster' did not complete.
+          Nothing was changed. If the previous creation failed, reset the nodes, run 'nkp delete bootstrap'
+          on the jump host, remove {{ cluster_kubeconfig }} and re-run.
+
+- name: Deploy NKP Preprovisioned cluster
+  when: not cluster_deploy_kubeconfig.stat.exists or cluster_deploy_kubeconfig.stat.size == 0
+  become: false
+  block:
+    - name: Remove an empty kubeconfig left by a previous failed run
+      when: cluster_deploy_kubeconfig.stat.exists
+      ansible.builtin.file:
+        path: "{{ cluster_kubeconfig }}"
+        state: absent
+
+    - name: Execute nkp create cluster preprovisioned (self-managed)
+      ansible.builtin.command:
+        argv:
+          - nkp
+          - create
+          - cluster
+          - preprovisioned
+          - --cluster-name
+          - "{{ cluster_name }}"
+          - --control-plane-endpoint-host
+          - "{{ control_plane_vip }}"
+          - --virtual-ip-interface
+          - "{{ virtual_ip_interface }}"
+          - --pre-provisioned-inventory-file
+          - preprovisioned_inventory.yaml
+          - --ssh-private-key-file
+          - "{{ cluster_ssh_key_path }}"
+          - --ssh-public-key-file
+          - "{{ cluster_ssh_key_path }}.pub"
+          - --ssh-username
+          - "{{ cluster_ssh_user }}"
+          - --control-plane-replicas
+          - "{{ groups['control_plane'] | length }}"
+          - --worker-replicas
+          - "{{ groups['workers'] | length }}"
+          - --kubernetes-pod-network-cidr
+          - "{{ pod_cidr }}"
+          - --kubernetes-service-cidr
+          - "{{ service_cidr }}"
+          - --timeout
+          - "{{ cluster_deploy_create_timeout_minutes | int }}m"
+          - --self-managed
+        chdir: "{{ nkp_workdir }}"
+      async: "{{ cluster_deploy_create_timeout_minutes | int * 60 + 600 }}"
+      poll: 15
+      register: cluster_deploy_nkp_create
+      changed_when: true
+  rescue:
+    # The KIND bootstrap container is left in place: before the pivot it holds
+    # the Cluster API objects and controller logs needed for diagnosis.
+    - name: Report the nkp create cluster failure
+      ansible.builtin.fail:
+        msg: >-
+          'nkp create cluster preprovisioned' failed
+          (rc={{ ansible_failed_result.rc | default('n/a') }}):
+          {{ (ansible_failed_result.stderr_lines | default([ansible_failed_result.msg | default('no output')]))[-15:] | join(' | ') }}.
+          The KIND bootstrap container 'konvoy-capi-bootstrapper-control-plane' was left on the jump host
+          for diagnosis, e.g.: docker exec konvoy-capi-bootstrapper-control-plane
+          kubectl --kubeconfig /etc/kubernetes/admin.conf get clusters,machines -A.
+          Before re-running, run 'nkp delete bootstrap' on the jump host and reset any node
+          that was already initialised.
+
+# Everything below the creation runs only after nkp returned successfully.
+- name: Recover the kubeconfig from the first Control Plane if nkp did not write it
+  when: cluster_deploy_nkp_create.rc | default(-1) == 0
+  become: false
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      umask 077
+      tmp="$(mktemp "{{ cluster_kubeconfig }}.XXXXXX")"
+      trap 'rm -f "$tmp"' EXIT
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "{{ cluster_ssh_key_path }}" \
+        "{{ cluster_ssh_user }}@{{ hostvars[groups['control_plane'][0]]['ansible_host'] }}" \
+        'sudo cat /etc/kubernetes/admin.conf' > "$tmp"
+      test -s "$tmp"
+      mv "$tmp" "{{ cluster_kubeconfig }}"
+    creates: "{{ cluster_kubeconfig }}"
+
+- name: Look for a leftover KIND bootstrap container on Jump Host
+  when: cluster_deploy_nkp_create.rc | default(-1) == 0
+  become: false
+  ansible.builtin.command:
+    argv:
+      - docker
+      - ps
+      - --all
+      - --quiet
+      - --filter
+      - name=^konvoy-capi-bootstrapper-control-plane$
+  register: cluster_deploy_bootstrap_container
+  changed_when: false
+
+- name: Clean up temporary KIND bootstrap container on Jump Host
+  when:
+    - cluster_deploy_nkp_create.rc | default(-1) == 0
+    - cluster_deploy_bootstrap_container.stdout | trim | length > 0
+  become: false
+  ansible.builtin.command:
+    cmd: docker rm -f konvoy-capi-bootstrapper-control-plane
+  changed_when: true
+
+- name: Restrict permissions of the cluster kubeconfig
+  ansible.builtin.file:
+    path: "{{ cluster_kubeconfig }}"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+
+# Fetched before waiting for the nodes: if the wait times out, the next run
+# still recognises the cluster as existing (see the preflight role).
+- name: Fetch kubeconfig to local machine
+  ansible.builtin.fetch:
+    src: "{{ cluster_kubeconfig }}"
+    dest: "{{ playbook_dir }}/../{{ cluster_name }}.conf"
+    flat: true
+
+- name: Restrict permissions of the local kubeconfig copy
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/../{{ cluster_name }}.conf"
+    mode: '0600'
+  delegate_to: localhost
+  become: false
+
+- name: Wait for all nodes to reach Ready state
+  ansible.builtin.command:
+    cmd: "kubectl --kubeconfig {{ cluster_kubeconfig }} wait --for=condition=Ready nodes --all --timeout=600s"
+  become: false
+  changed_when: false

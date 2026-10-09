@@ -1,0 +1,256 @@
+---
+# CIS Level 1 aligned baseline (subset of controls) - audit tasks.
+# Included by cis_audit.yml and by Stage 2.5 of ansible/site.yml. The including
+# play must load role "common". Read-only: nothing is changed on the hosts.
+#
+# The collection tasks never fail on a non-zero return code: a missing file,
+# key or service is evaluated as FAIL in the report. The play fails at the end
+# when any control fails, unless -e cis_audit_strict=false is given.
+#
+# Control 9 (host firewall) is evaluated only where the hardening manages the
+# firewall. On cluster nodes without the opt-in it is reported as "NOT APPLIED
+# (by design)" together with the observed firewall state, and never as FAIL.
+
+- name: Load the CIS baseline definitions
+  ansible.builtin.include_vars:
+    file: ../vars/baseline.yml
+
+- name: Audit 1 - Read the effective modprobe configuration
+  ansible.builtin.command:
+    cmd: modprobe --showconfig
+  register: cis_audit_modprobe
+  changed_when: false
+  failed_when: false
+
+- name: Audit 2 - Read the running sysctl values
+  ansible.builtin.command:
+    argv: "{{ ['sysctl'] + (cis_sysctl_settings | map('regex_replace', '=.*$', '') | list) }}"
+  register: cis_audit_sysctl
+  changed_when: false
+  failed_when: false
+
+- name: Audit 3 - Read the state of auditd, chrony and cron
+  ansible.builtin.command:
+    cmd: "systemctl is-active {{ item }}"
+  register: cis_audit_services
+  changed_when: false
+  failed_when: false
+  loop: "{{ cis_services }}"
+
+- name: Audit 4 - Read the loaded auditd rules
+  ansible.builtin.command:
+    cmd: auditctl -l
+  register: cis_audit_auditctl
+  changed_when: false
+  failed_when: false
+
+- name: Audit 5 - Read identity file and cron permissions
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  register: cis_audit_files
+  loop: "{{ cis_file_permissions }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Audit 6 - Read the default umask for login shells
+  ansible.builtin.command:
+    cmd: grep -Eq '^\s*umask\s+027\s*$' /etc/profile.d/60-cis-umask.sh
+  register: cis_audit_umask
+  changed_when: false
+  failed_when: false
+
+- name: Audit 6 - Read the defaults for new user accounts
+  ansible.builtin.command:
+    cmd: useradd -D
+  register: cis_audit_useradd
+  changed_when: false
+  failed_when: false
+
+- name: Audit 6 - Read the password quality requirements
+  ansible.builtin.command:
+    cmd: grep -Ec '^\s*(minlen\s*=\s*14|[dulo]credit\s*=\s*-1)\s*$' /etc/security/pwquality.conf
+  register: cis_audit_pwquality
+  changed_when: false
+  failed_when: false
+
+- name: Audit 7 - Read the login warning banner files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: cis_audit_banners
+  loop: "{{ cis_banner_files }}"
+
+# Return code 1 means that no banner discloses OS details through \m \r \s \v.
+- name: Audit 7 - Search the login banners for OS information
+  ansible.builtin.command:
+    cmd: grep -E '\\[mrsv]' /etc/issue /etc/issue.net
+  register: cis_audit_banner_escapes
+  changed_when: false
+  failed_when: false
+
+- name: Audit 8 - Read the effective OpenSSH daemon configuration
+  ansible.builtin.command:
+    cmd: /usr/sbin/sshd -T
+  register: cis_audit_sshd
+  changed_when: false
+  failed_when: false
+
+- name: Audit 9 - Read the firewalld state (RedHat / Rocky)
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - cis_firewall_managed | bool
+  ansible.builtin.command:
+    cmd: "firewall-cmd {{ item }}"
+  register: cis_audit_firewalld
+  changed_when: false
+  failed_when: false
+  loop:
+    - --state
+    - --list-services
+    - --zone=trusted --list-sources
+    - --list-ports
+    - --query-masquerade
+
+- name: Audit 9 - Read the UFW state (Debian / Ubuntu)
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - cis_firewall_managed | bool
+  ansible.builtin.command:
+    cmd: ufw status verbose
+  environment:
+    LC_ALL: C
+  register: cis_audit_ufw
+  changed_when: false
+  failed_when: false
+
+# Informational only: shown next to "NOT APPLIED (by design)" in the report.
+- name: Audit 9 - Read the firewall state of a cluster node where it is not managed
+  when: not (cis_firewall_managed | bool)
+  ansible.builtin.command:
+    cmd: "{{ 'systemctl is-active firewalld' if ansible_facts['os_family'] == 'RedHat' else 'ufw status' }}"
+  environment:
+    LC_ALL: C
+  register: cis_audit_unmanaged_firewall
+  changed_when: false
+  failed_when: false
+
+# One entry per control, listing what is wrong; an empty string means PASS.
+- name: Evaluate the collected state
+  ansible.builtin.set_fact:
+    cis_audit_findings: "{{ cis_audit_evaluation | map('default', '', true) | map('string') | map('trim') | list }}"
+  vars:
+    cis_audit_evaluation:
+      - >-
+        {%- set lines = cis_audit_modprobe.stdout_lines | default([]) | map('regex_replace', '\s+', ' ') | map('trim') | list -%}
+        {%- for module in cis_fs_modules -%}
+        {%- if ('install ' ~ module ~ ' /bin/false') not in lines or ('blacklist ' ~ module) not in lines -%}
+        {{ module }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+      - >-
+        {%- set lines = cis_audit_sysctl.stdout_lines | default([]) | map('regex_replace', '\s*=\s*', '=') | list -%}
+        {%- for setting in cis_sysctl_settings -%}
+        {%- if setting not in lines -%}
+        {{ setting }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+      - >-
+        {%- for result in cis_audit_services.results -%}
+        {%- if result.stdout | default('') | trim != 'active' -%}
+        {{ result.item }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+      - >-
+        {%- for key in cis_auditd_keys -%}
+        {%- if cis_audit_auditctl.stdout | default('') is not search('(-k |key=)' ~ key ~ '(\s|$)') -%}
+        {{ key }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+      - >-
+        {%- for result in cis_audit_files.results -%}
+        {%- if not result.stat.exists
+              or result.stat.mode != result.item.mode
+              or result.stat.pw_name != 'root'
+              or result.stat.gr_name != result.item.group -%}
+        {{ result.item.path }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+      - >-
+        {{ '' if cis_audit_umask.rc | default(1) == 0 else 'umask ' -}}
+        {{ '' if 'INACTIVE=30' in cis_audit_useradd.stdout_lines | default([]) else 'INACTIVE ' -}}
+        {{ '' if cis_audit_pwquality.stdout | default('') | trim == '5' else 'pwquality ' }}
+      - >-
+        {%- for result in cis_audit_banners.results -%}
+        {%- if not result.stat.exists
+              or result.stat.size == 0
+              or result.stat.mode != '0644'
+              or result.stat.pw_name != 'root' -%}
+        {{ result.item }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+        {{ '' if cis_audit_banner_escapes.rc | default(0) == 1 else 'os-information' }}
+      - >-
+        {%- set lines = cis_audit_sshd.stdout_lines | default([]) | map('lower') | list -%}
+        {%- for setting in cis_sshd_settings -%}
+        {%- if setting | lower not in lines -%}
+        {{ setting.split(' ')[0] }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+      - >-
+        {%- set sources = cis_firewall_trusted_sources if cis_is_k8s_node | bool else [] -%}
+        {%- if not (cis_firewall_managed | bool) -%}
+        {%- elif ansible_facts['os_family'] == 'RedHat' -%}
+        {%- set state = cis_audit_firewalld.results[0].stdout | default('') | trim -%}
+        {%- set services = (cis_audit_firewalld.results[1].stdout | default('')).split() -%}
+        {%- set trusted = (cis_audit_firewalld.results[2].stdout | default('')).split() -%}
+        {%- set ports = (cis_audit_firewalld.results[3].stdout | default('')).split() -%}
+        {%- set masquerade = cis_audit_firewalld.results[4].stdout | default('') | trim -%}
+        {{ '' if state == 'running' else 'not-running ' -}}
+        {{ '' if 'ssh' in services else 'ssh ' -}}
+        {{ '' if (cis_ssh_port | int == 22 or (cis_ssh_port ~ '/tcp') in ports) else 'ssh-port-' ~ cis_ssh_port ~ ' ' -}}
+        {%- for source in sources -%}
+        {%- if source not in trusted -%}
+        {{ source }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+        {%- if cis_is_k8s_node | bool -%}
+        {{ '' if masquerade == ('yes' if node_firewalld_masquerade | default(true) | bool else 'no') else 'masquerade ' -}}
+        {%- endif -%}
+        {%- else -%}
+        {%- set status = cis_audit_ufw.stdout | default('') -%}
+        {{ '' if 'Status: active' in status else 'not-active ' -}}
+        {{ '' if 'deny (incoming)' in status or 'reject (incoming)' in status else 'default-incoming ' -}}
+        {{ '' if status is search('(^|\n)' ~ cis_ssh_port ~ '/tcp\s+ALLOW') else 'ssh ' -}}
+        {%- if cis_is_k8s_node | bool -%}
+        {{ '' if 'allow (routed)' in status else 'default-routed ' -}}
+        {%- endif -%}
+        {%- for source in sources -%}
+        {%- if status is not search('ALLOW( IN)?\s+' ~ (source | regex_escape) ~ '(\s|$)') -%}
+        {{ source }}{{ ' ' }}{%- endif -%}
+        {%- endfor -%}
+        {%- endif -%}
+
+- name: Display the CIS Level 1 aligned baseline audit report
+  ansible.builtin.debug:
+    msg: "{{ cis_audit_report.split('\n') }}"
+  vars:
+    cis_audit_firewall_note: >-
+      {{ cis_firewall_not_applied_note | trim }};
+      observed: {{ 'firewalld' if ansible_facts['os_family'] == 'RedHat' else 'ufw' }}
+      {{ (cis_audit_unmanaged_firewall.stdout | default('') | trim | lower | regex_replace('^status:\s*', ''))
+         | default('state unknown', true) }}
+    cis_audit_report: |-
+      HOST: {{ inventory_hostname }} ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }},
+      {{- ' cluster node' if cis_is_k8s_node | bool else ' generic host' }})
+      {% for control in cis_controls %}
+      {% set finding = cis_audit_findings[loop.index0] %}
+      {% if control.id == 9 and not (cis_firewall_managed | bool) %}
+      {{ '%d. %-45s %s' | format(control.id, control.title, cis_audit_firewall_note) }}
+      {% else %}
+      {{ '%d. %-45s %s' | format(control.id, control.title, 'FAIL: ' ~ finding if finding else 'PASS') }}
+      {% endif %}
+      {% endfor %}
+      RESULT: {{ cis_audit_findings | select | list | length }} of {{ cis_controls | length }} controls failed
+      {{- '' if cis_firewall_managed | bool else ', 1 not applied by design' }}
+
+- name: Fail when a control of the baseline is not met
+  when: cis_audit_strict | default(true) | bool
+  ansible.builtin.assert:
+    that:
+      - cis_audit_findings | select | list | length == 0
+    fail_msg: >-
+      One or more controls of the CIS Level 1 aligned baseline failed on
+      {{ inventory_hostname }} (see the report above). Run the hardening again,
+      or pass -e cis_audit_strict=false to report without failing.
+    quiet: true

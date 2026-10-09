@@ -1,0 +1,42 @@
+---
+# ==============================================================================
+# Role Defaults: preflight
+# ==============================================================================
+
+# Size thresholds the hosts are checked against: the "General Resource
+# Requirements for Pro and Ultimate Clusters" table of the NKP 2.18 guide.
+# Pre-provisioned infrastructure requires an NKP Pro or Ultimate licence, so
+# these are the requirements that apply; the toolkit does not create or size
+# the machines, it only verifies them. A smaller lab may lower single values
+# knowingly (platform applications may then lack resources).
+# Memory thresholds sit slightly below the nominal size (8 / 16 / 32 GiB)
+# because the kernel reports less than the RAM assigned to the machine.
+preflight_jump_host_min_vcpus: 4
+preflight_jump_host_min_mem_mb: 7500
+preflight_control_plane_min_vcpus: 4
+preflight_control_plane_min_mem_mb: 15000
+preflight_worker_min_vcpus: 8
+preflight_worker_min_mem_mb: 30000
+# Lab shortcut only (local_volume_devices empty): the local volumes are
+# directories under /var/local-disks on the workers, so each reports the size
+# of the filesystem holding that path (/, or /var when it is a separate
+# filesystem). Prometheus asks for a 100 GiB volume: a smaller filesystem
+# leaves its claim pending.
+preflight_worker_min_root_fs_gib: 105
+# Smallest raw disk Rook Ceph accepts as OSD (ceph_osd_device). The local
+# volume devices are checked against local_volume_min_gib (role "common").
+preflight_ceph_osd_min_gib: 40
+# Worker count of the guide table; fewer workers only produce a warning.
+preflight_recommended_workers: 4
+
+# false skips the existence and checksum checks of the NKP CLI binary on the
+# control machine (set by verify_hosts.yml, which installs nothing).
+preflight_check_nkp_binary: true
+
+# Longest wait, in seconds, for cloud-init to finish on a freshly created host.
+preflight_cloud_init_timeout: 1200
+
+# Set to true to skip the "VIP unassigned" and "port 6443 free" checks when
+# the cluster already exists but no kubeconfig is left on the control machine
+# or on the jump host.
+preflight_assume_existing_cluster: false

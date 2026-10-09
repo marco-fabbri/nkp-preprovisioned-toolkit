@@ -1,0 +1,12 @@
+---
+# Collections whose modules are used by the playbooks:
+#   ansible.posix     authorized_key, firewalld, mount, selinux, sysctl
+#   community.general modprobe, ufw
+#   community.crypto  openssh_keypair
+collections:
+  - name: ansible.posix
+    version: ">=1.5.0"
+  - name: community.general
+    version: ">=8.0.0"
+  - name: community.crypto
+    version: ">=2.15.0"

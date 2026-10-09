@@ -1,0 +1,29 @@
+---
+# ==============================================================================
+# Role: storage_network - MetalLB Ingress Pool & Ceph Loop Devices on Workers
+# ==============================================================================
+
+- name: Generate manifest for MetalLB IP pool
+  ansible.builtin.template:
+    src: metallb-pool.yaml.j2
+    dest: "{{ nkp_workdir }}/metallb-pool.yaml"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0644'
+
+- name: Apply MetalLB IPAddressPool and L2Advertisement
+  ansible.builtin.command:
+    cmd: "kubectl --kubeconfig {{ cluster_kubeconfig }} apply -f metallb-pool.yaml"
+    chdir: "{{ nkp_workdir }}"
+  become: false
+  register: storage_network_metallb_apply
+  until: storage_network_metallb_apply.rc == 0
+  retries: 15
+  delay: 10
+  changed_when: storage_network_metallb_apply.stdout_lines | reject('search', ' unchanged$') | list | length > 0
+
+- name: Setup Ceph OSD disks on Worker nodes
+  ansible.builtin.include_tasks: ceph_worker.yml
+  loop: "{{ groups['workers'] }}"
+  loop_control:
+    label: "{{ item }} ({{ hostvars[item]['ansible_host'] }})"

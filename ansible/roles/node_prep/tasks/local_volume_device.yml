@@ -1,0 +1,82 @@
+---
+# One local volume device: node_prep_volume (an entry of common_data_disks,
+# role "common") becomes volume node_prep_volume.volume, its position in
+# local_volume_devices. node_prep_volume_device is the kernel name the
+# configured value resolved to at this run. The disk is never partitioned: it
+# is formatted whole when it carries no file system and mounted by UUID, so the
+# mount survives a change of kernel names at the next boot.
+
+- name: Read local volume device /dev/{{ node_prep_volume_device }}
+  ansible.builtin.command:
+    argv: ['lsblk', '-J', '-b', '-o', 'NAME,TYPE,FSTYPE,PTTYPE,MOUNTPOINT', "/dev/{{ node_prep_volume_device }}"]
+  register: node_prep_volume_lsblk
+  changed_when: false
+  failed_when: false
+
+# A whole disk without partition table, either blank or already carrying the
+# local volume file system, and mounted nowhere else than its own mount point.
+# The mount point itself must not be taken by another device (for example the
+# bind mount of the lab shortcut on a host that is switched to devices).
+- name: Verify the device is a blank whole disk or carries the local volume file system, /dev/{{ node_prep_volume_device }}
+  vars:
+    node_prep_volume_info: >-
+      {{ ((node_prep_volume_lsblk.stdout | default('') or '{}') | from_json).blockdevices | default([{}]) | first | default({}) }}
+    node_prep_volume_other_mounts: >-
+      {{ ansible_facts['mounts'] | selectattr('mount', 'equalto', node_prep_volume_path)
+         | map(attribute='device') | reject('equalto', '/dev/' ~ node_prep_volume_device) | list }}
+  ansible.builtin.assert:
+    that:
+      - node_prep_volume_lsblk.rc == 0
+      - node_prep_volume_info.type | default('') == 'disk'
+      - node_prep_volume_info.children | default([]) | length == 0
+      - node_prep_volume_info.pttype | default('', true) | length == 0
+      - node_prep_volume_info.fstype | default('', true) in ['', local_volume_fstype]
+      - node_prep_volume_info.mountpoint | default('', true) in ['', node_prep_volume_path]
+      - node_prep_volume_other_mounts | length == 0
+    fail_msg: >-
+      {{ node_prep_volume.value }} (/dev/{{ node_prep_volume_device }}) on {{ inventory_hostname }} cannot be used as local volume
+      {{ node_prep_volume_path }}: it must exist, be a whole disk without partitions or partition table
+      (wipefs --all or sgdisk --zap-all clears them), carry no file system or a {{ local_volume_fstype }}
+      file system, and be mounted nowhere else. The toolkit never erases a foreign file system.
+      {{ 'The mount point is already taken by ' ~ (node_prep_volume_other_mounts | join(', '))
+         ~ ': unmount it and remove its /etc/fstab line first.' if node_prep_volume_other_mounts | length > 0 else '' }}
+      lsblk reported: {{ node_prep_volume_lsblk.stdout | default('') }} {{ node_prep_volume_lsblk.stderr | default('') }}
+    quiet: true
+
+# community.general.filesystem formats only a device without any file system;
+# the assertion above already excluded every other case.
+- name: Create the local volume file system on /dev/{{ node_prep_volume_device }}
+  community.general.filesystem:
+    dev: "/dev/{{ node_prep_volume_device }}"
+    fstype: "{{ local_volume_fstype }}"
+
+# Low-level probe (-p): the blkid cache may not know a file system created a moment ago.
+- name: Read the file system UUID of /dev/{{ node_prep_volume_device }}
+  ansible.builtin.command:
+    argv: ['blkid', '-p', '-s', 'UUID', '-o', 'value', "/dev/{{ node_prep_volume_device }}"]
+  register: node_prep_volume_uuid
+  changed_when: false
+
+- name: Verify the file system UUID of /dev/{{ node_prep_volume_device }}
+  ansible.builtin.assert:
+    that:
+      - node_prep_volume_uuid.stdout | trim | length > 0
+    fail_msg: >-
+      blkid returned no UUID for {{ node_prep_volume.value }} (/dev/{{ node_prep_volume_device }}) on
+      {{ inventory_hostname }}: the file system was not created.
+    quiet: true
+
+- name: Create mount point {{ node_prep_volume_path }}
+  ansible.builtin.file:
+    path: "{{ node_prep_volume_path }}"
+    state: directory
+    mode: '0755'
+
+# nofail: a missing disk must not block the boot of the node.
+- name: Mount the local volume by UUID through /etc/fstab at {{ node_prep_volume_path }}
+  ansible.posix.mount:
+    path: "{{ node_prep_volume_path }}"
+    src: "UUID={{ node_prep_volume_uuid.stdout | trim }}"
+    fstype: "{{ local_volume_fstype }}"
+    opts: defaults,noatime,nofail
+    state: mounted

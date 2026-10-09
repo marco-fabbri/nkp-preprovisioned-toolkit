@@ -1,0 +1,64 @@
+# Vendor binaries (obtain the NKP CLI from the Nutanix Support Portal)
+downloads/*
+!downloads/.gitkeep
+!downloads/README.md
+*.tar.gz
+*.tgz
+
+# Vendor documentation
+kb/*
+!kb/.gitkeep
+!kb/README.md
+*.pdf
+
+# Inventories hold addresses and credentials; only the example is tracked
+inventory*.ini
+!inventory.example.ini
+
+# Kubeconfigs (fetched to the repository root as <cluster_name>.conf)
+/*.conf
+*.kubeconfig
+kubeconfig
+preprovisioned_inventory.yaml
+
+# NKP license keys
+*.jwt
+*.lic
+license*.txt
+licenses/
+
+# Keys and secrets
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.env
+.vault_pass*
+
+# Ansible and Python
+*.retry
+*.log
+.ansible/
+__pycache__/
+.venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.claude/
+*.swp
+*.bak
+*~
+
+# OpenTofu state and credentials
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+*.auto.tfvars
+
+# Images, OVAs and cidata ISOs the VMware modules build on this computer
+tofu/*/.cache/

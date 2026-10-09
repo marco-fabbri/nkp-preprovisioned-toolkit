@@ -1,0 +1,313 @@
+---
+# ==============================================================================
+# Role: kommander_deploy - Install Kommander Platform Services
+# ==============================================================================
+# Requires the "common" role defaults (cluster_kubeconfig, nkp_workdir).
+
+- name: Check if Kommander is already installed on the cluster
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - -n
+      - kommander
+      - get
+      - svc
+      - kommander-traefik
+      - --ignore-not-found
+      - -o
+      - name
+  become: false
+  register: kommander_deploy_installed_check
+  changed_when: false
+
+# The default Ceph configuration asks for block-mode volumes, which the local
+# static provisioner of pre-provisioned clusters cannot provide. The NKP guide
+# prescribes host storage mode instead: Ceph takes the node devices matching
+# a filter (ceph_device_filter for a kernel name, ceph_device_path_filter for an
+# absolute path, see role "common"). Rook never selects a loop device through a
+# filter, so the lab
+# shortcut names the device explicitly. Only workers are checked for the
+# device, so the OSD placement keeps Rook off the control plane nodes.
+- name: Generate the default Kommander installer configuration
+  ansible.builtin.command:
+    argv: ['nkp', 'install', 'kommander', '--init']
+    chdir: "{{ nkp_workdir }}"
+  become: false
+  register: kommander_deploy_init
+  changed_when: false
+
+# The file is regenerated on every run: customisations go through
+# kommander_deploy_installer_overrides, combined last.
+- name: Write the Kommander installer configuration with Ceph in host storage mode
+  vars:
+    kommander_deploy_ceph_values_disk: |
+      cephClusterSpec:
+        placement:
+          osd:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: DoesNotExist
+        storage:
+          storageClassDeviceSets: []
+          useAllNodes: true
+          useAllDevices: false
+          {{ kommander_deploy_ceph_selector }}
+    # A kernel name selects the disk by name (deviceFilter); an absolute path
+    # such as /dev/disk/by-id/... selects it by link (devicePathFilter: Rook
+    # matches it against /dev/<name> and the /dev/disk/by-* links of each
+    # device). to_json writes a YAML-safe double-quoted string, backslashes of
+    # the escaped path included.
+    kommander_deploy_ceph_selector: >-
+      {{ ('devicePathFilter: ' ~ (ceph_device_path_filter | to_json)) if ceph_osd_device is match('/')
+         else ('deviceFilter: ' ~ (ceph_device_filter | to_json)) }}
+    kommander_deploy_ceph_values_loop: |
+      cephClusterSpec:
+        placement:
+          osd:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: DoesNotExist
+        storage:
+          storageClassDeviceSets: []
+          useAllNodes: true
+          useAllDevices: false
+          devices:
+            - name: "/dev/{{ ceph_loop_device_name }}"
+    kommander_deploy_ceph_app:
+      apps:
+        rook-ceph-cluster:
+          enabled: true
+          values: "{{ kommander_deploy_ceph_values_disk if ceph_osd_device | length > 0 else kommander_deploy_ceph_values_loop }}"
+    # A JSON string (inventory.ini) is accepted as well as a dict (-e or YAML).
+    kommander_deploy_overrides: >-
+      {{ kommander_deploy_installer_overrides | from_yaml
+         if kommander_deploy_installer_overrides is string else kommander_deploy_installer_overrides }}
+  ansible.builtin.copy:
+    dest: "{{ kommander_deploy_installer_config }}"
+    content: >-
+      {{ kommander_deploy_init.stdout | from_yaml
+         | combine(kommander_deploy_ceph_app, kommander_deploy_overrides, recursive=true) | to_nice_yaml(indent=2) }}
+    mode: '0644'
+  become: false
+  register: kommander_deploy_config_file
+
+# Also runs when the configuration changed: the guide allows re-running the
+# installer to reconfigure the applications.
+- name: Execute nkp install kommander
+  ansible.builtin.command:
+    argv:
+      - nkp
+      - install
+      - kommander
+      - --installer-config
+      - "{{ kommander_deploy_installer_config }}"
+      - --wait=false
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+    chdir: "{{ nkp_workdir }}"
+  become: false
+  when: kommander_deploy_installed_check.stdout | trim | length == 0 or kommander_deploy_config_file is changed
+  changed_when: true
+
+# Not fatal on timeout: the summary banner reports the address as pending.
+- name: Wait for external IP assignment to Traefik Ingress service
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - -n
+      - kommander
+      - get
+      - svc
+      - kommander-traefik
+      - -o
+      - jsonpath={.status.loadBalancer.ingress[0].ip}
+  become: false
+  register: kommander_deploy_traefik_ip
+  until: kommander_deploy_traefik_ip.rc == 0 and kommander_deploy_traefik_ip.stdout | trim | length > 0
+  retries: 60
+  delay: 10
+  changed_when: false
+  failed_when: false
+
+# ------------------------------------------------------------------------------
+# License: never applied or changed by this toolkit. The licence is bound to the
+# Cluster UUID, the UID of the kube-system namespace, which exists only once
+# the cluster is created: the summary prints it with the activation steps.
+# ------------------------------------------------------------------------------
+- name: Read the Cluster UUID (UID of the kube-system namespace)
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - get
+      - namespace
+      - kube-system
+      - -o
+      - jsonpath={.metadata.uid}
+  become: false
+  register: kommander_deploy_cluster_uuid
+  changed_when: false
+  failed_when: false
+
+# Read-only and best effort: the banner prints "unknown" when the query fails.
+- name: Query license status reported by Kommander
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - -n
+      - kommander
+      - get
+      - license.kommander.mesosphere.io
+      - >-
+        -o=jsonpath={range .items[*]}{.metadata.name}: tier={.status.dkpLevel} valid={.status.valid}
+        licenseId={.status.licenseId} clusters={.status.clusterCapacity} cores={.status.coreCapacity}{"\n"}{end}
+  become: false
+  register: kommander_deploy_license_status_out
+  until: kommander_deploy_license_status_out.rc == 0
+  retries: 6
+  delay: 10
+  changed_when: false
+  failed_when: false
+
+# Read-only and best effort. Kommander is installed with --wait=false, so an
+# address on the ingress service does not mean the applications are ready: the
+# banner title is "successfully" only when every HelmRelease reports Ready.
+# A slow start (image pulls, probes) can make a Helm action time out. Flux then
+# marks the release "Stalled" and stops retrying, even once the application
+# runs. Resetting the failure counters makes it reconcile again.
+- name: Read the Kommander HelmReleases
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - -n
+      - kommander
+      - get
+      - helmreleases.helm.toolkit.fluxcd.io
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Stalled")].status}{"\n"}{end}'
+  become: false
+  register: kommander_deploy_helmreleases
+  changed_when: false
+  failed_when: false
+
+# Flux honours resetAt and forceAt only when they equal requestedAt: one value for all three.
+- name: Pick one timestamp for the Flux reset annotations
+  ansible.builtin.set_fact:
+    kommander_deploy_now: "{{ now(utc=true, fmt='%s') }}"
+
+- name: Reset the HelmReleases Flux stopped retrying
+  vars:
+    kommander_deploy_stalled: >-
+      {{ kommander_deploy_helmreleases.stdout_lines | default([]) | select('match', '.+=True$')
+         | map('regex_replace', '=True$', '') | list
+         if kommander_deploy_helmreleases.rc == 0 else [] }}
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - -n
+      - kommander
+      - annotate
+      - helmreleases.helm.toolkit.fluxcd.io
+      - "{{ item }}"
+      - --overwrite
+      - "reconcile.fluxcd.io/requestedAt={{ kommander_deploy_now }}"
+      - "reconcile.fluxcd.io/resetAt={{ kommander_deploy_now }}"
+      - "reconcile.fluxcd.io/forceAt={{ kommander_deploy_now }}"
+  become: false
+  loop: "{{ kommander_deploy_stalled }}"
+  changed_when: true
+
+- name: Query the state of the Kommander applications
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - -n
+      - kommander
+      - get
+      - helmreleases.helm.toolkit.fluxcd.io
+      - '-o=jsonpath={range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+  become: false
+  register: kommander_deploy_helmreleases_out
+  changed_when: false
+  failed_when: false
+
+- name: Print cluster access details and summary banner
+  ansible.builtin.debug:
+    msg: "{{ banner_access + banner_license }}"
+  vars:
+    banner_rule: "=============================================================================="
+    banner_sep: "------------------------------------------------------------------------------"
+    banner_jump_ip: "{{ hostvars[groups['jump_host'][0]]['ansible_host'] | default(groups['jump_host'][0], true) }}"
+    banner_ingress_ip: "{{ kommander_deploy_traefik_ip.stdout | default('', true) | trim }}"
+    banner_ingress_ready: "{{ banner_ingress_ip | length > 0 }}"
+    banner_apps: >-
+      {{ kommander_deploy_helmreleases_out.stdout_lines | default([]) | select | list
+         if (kommander_deploy_helmreleases_out.rc | default(1)) == 0 else [] }}
+    banner_apps_ready: "{{ banner_apps | select('match', '.*=True$') | list }}"
+    banner_all_ready: >-
+      {{ (banner_ingress_ready | bool) and banner_apps | length > 0
+         and banner_apps_ready | length == banner_apps | length }}
+    banner_apps_summary: >-
+      {{ (banner_apps_ready | length ~ ' of ' ~ banner_apps | length ~ ' applications ready')
+         if banner_apps | length > 0 else 'application state unknown' }}
+    banner_cluster_uuid: >-
+      {{ kommander_deploy_cluster_uuid.stdout | trim
+         if (kommander_deploy_cluster_uuid.rc | default(1)) == 0 and kommander_deploy_cluster_uuid.stdout | trim | length > 0
+         else 'unknown (run on the jump host: kubectl --kubeconfig ' ~ cluster_kubeconfig ~ ' get namespace kube-system -o jsonpath={.metadata.uid})' }}
+    banner_license_status: >-
+      {{
+        'unknown (the license query failed)'
+        if (kommander_deploy_license_status_out.rc | default(1)) != 0
+        else (kommander_deploy_license_status_out.stdout_lines | default([], true) | join('; ')
+              | default('no License resource found in namespace kommander', true))
+      }}
+    banner_access:
+      - "{{ banner_rule }}"
+      - "{{ 'NKP PREPROVISIONED CLUSTER DEPLOYED SUCCESSFULLY' if banner_all_ready | bool
+            else 'NKP CLUSTER CREATED - KOMMANDER STILL CONVERGING ('
+                 ~ ('' if banner_ingress_ready | bool else 'dashboard address not assigned yet, ')
+                 ~ banner_apps_summary ~ ')' }}"
+      - "{{ banner_rule }}"
+      - "Jump Host Access:"
+      - "  IP: {{ banner_jump_ip }}"
+      - "  User: {{ ansible_user }}"
+      - "  SSH: ssh {{ ansible_user }}@{{ banner_jump_ip }}"
+      - "{{ banner_sep }}"
+      - "Control Plane API VIP: https://{{ control_plane_vip }}:6443"
+      - "{{ 'NKP Dashboard: https://' ~ banner_ingress_ip ~ '/dkp/kommander/dashboard' if banner_ingress_ready | bool
+            else 'NKP Dashboard: pending - no external IP on service kommander/kommander-traefik after 10 minutes' }}"
+      - "Dashboard credentials (run on the jump host): nkp get dashboard --kubeconfig {{ cluster_kubeconfig }}"
+      - "Kommander applications: {{ banner_apps_summary }}"
+      - "Application status (run on the jump host): kubectl --kubeconfig {{ cluster_kubeconfig }} -n kommander get helmreleases"
+      - "Kubeconfig on the jump host: {{ cluster_kubeconfig }}"
+      - "{{ banner_sep }}"
+    banner_license:
+      - "NKP LICENSE"
+      - "{{ banner_sep }}"
+      - "Cluster UUID (UID of the kube-system namespace): {{ banner_cluster_uuid }}"
+      - "License status reported by the cluster: {{ banner_license_status }}"
+      - "Until a licence is activated the cluster runs on the default key NKP assigns (tier Pro, no license id,"
+      - "zero capacity) and the dashboard reports that no license is activated. To activate yours:"
+      - "  1. request an NKP Pro or Ultimate licence for the Cluster UUID above on the Nutanix Support Portal;"
+      - "  2. in the NKP dashboard select Global > Settings > Licensing > Activate License and enter the key."
+      - "This toolkit never applies or changes the licence."
+      - "{{ banner_rule }}"

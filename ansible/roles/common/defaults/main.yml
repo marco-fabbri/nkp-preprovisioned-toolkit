@@ -1,0 +1,111 @@
+---
+# ==============================================================================
+# Role Defaults: common - variables shared by every play
+# ==============================================================================
+# Role defaults have the lowest precedence: any value below can be overridden
+# in inventory.ini or with -e. The role has no main task list; list it first in
+# a play. tasks/data_disks.yml resolves the worker data disks and is included
+# by the roles and playbooks that use them (include_role, tasks_from).
+
+# Subnet of the node's primary interface (derived per host from gathered facts).
+# It is the only node network trusted by the host firewall rules.
+node_subnet_cidr: >-
+  {{ (ansible_facts['default_ipv4'] | default({})).get('network', '') }}/{{ (ansible_facts['default_ipv4'] | default({})).get('prefix', '') }}
+
+# Kubernetes Pod and Service networks, passed to "nkp create cluster".
+# They must not overlap the node subnet, the VIP or the MetalLB pool.
+pod_cidr: "192.168.0.0/16"
+service_cidr: "10.96.0.0/12"
+
+# kubectl client installed on the jump host. Keep it within one minor version
+# of the Kubernetes release deployed by the NKP CLI (NKP 2.18.0 ships 1.35.2).
+kubectl_version: "v1.35.2"
+
+# Password set for ansible_user on every host (console fallback).
+# Set it to an empty string to leave the existing password untouched.
+vm_default_password: "nutanix/4u"
+# Per-host deterministic salt, so the password task stays idempotent.
+vm_default_password_salt: "{{ (inventory_hostname | hash('sha256'))[:16] }}"
+
+# SSH password logins. The roles write an sshd drop-in with
+# "PasswordAuthentication yes" (true) or "PasswordAuthentication no" (false).
+ssh_password_authentication: true
+
+# Host firewall on cluster nodes. The NKP guide lists "firewalld disabled" as a
+# prerequisite of pre-provisioned machines, so the toolkit never enables a
+# firewall on a node unless asked to (see README.md, "Host firewalls"):
+#   cis_firewalld_on_nodes  -cis profiles, Rocky: install and enable firewalld
+#   cis_ufw_on_nodes        -cis profiles, Ubuntu: enable UFW
+# Both are outside the vendor prerequisites. The jump host is not a cluster
+# node and always gets its firewall with a -cis profile.
+cis_firewalld_on_nodes: false
+cis_ufw_on_nodes: false
+
+# Masquerading in the default firewalld zone of Rocky cluster nodes, applied
+# whenever firewalld is running there (any profile): true enables it, false
+# disables it. cis_firewalld_masquerade is the name used by earlier revisions.
+node_firewalld_masquerade: "{{ cis_firewalld_masquerade | default(true) }}"
+
+# Worker disk layout of the NKP 2.18 guide: the OS disk, one raw disk for the
+# Rook Ceph OSD and dedicated disks for the local volume provisioner. The
+# toolkit never partitions a disk. Each value is either a kernel name without
+# /dev/ (sdb) or an absolute path (/dev/disk/by-id/..., /dev/disk/by-path/...),
+# and must designate the same disk on every worker.
+#
+# Prefer /dev/disk/by-id paths: kernel names follow the order in which the
+# kernel detects the disks, not the hypervisor slot, and can change at the next
+# boot (seen on Proxmox: the disk in slot scsi2 came up as sdb, the one in
+# scsi1 as sdc). The defaults keep kernel names for compatibility; the
+# preflight warns about them. Every value is resolved on each worker to its
+# kernel name (readlink -f, tasks/data_disks.yml) before it is used, and the run
+# stops when a value resolves to no disk, to the same disk as another value or
+# to the disk that holds the root file system.
+
+# Disk each worker gives to Rook Ceph. It must be a raw disk of at least
+# 40 GiB: no partitions, no file system. Set it to an empty string for the lab
+# shortcut: a loop device backed by a sparse image file on the worker root disk.
+ceph_osd_device: "sdb"
+ceph_loop_device_name: loop100
+# Selection of the disk by Rook Ceph on every node (raw disk only; the loop
+# device is named explicitly). A kernel name becomes deviceFilter, a regular
+# expression matched against the kernel name of each device; an absolute path
+# becomes devicePathFilter, matched against /dev/<name> and every
+# /dev/disk/by-* link of each device (regex-escaped, anchored at both ends).
+ceph_device_filter: "^{{ ceph_osd_device }}$"
+ceph_device_path_filter: "^{{ ceph_osd_device | regex_escape }}$"
+
+# Disks each worker gives to the local volume provisioner, one volume per disk:
+# volume N is the N-th entry of the list, whatever its kernel name. A disk
+# without a file system is formatted whole with local_volume_fstype and
+# mounted by UUID through /etc/fstab at local_volume_mount_prefix<N> (N = 1..),
+# a disk that already carries that file system is left untouched, anything else
+# (foreign file system, partition table, other mount point) stops the run.
+# Prometheus alone claims a 100 GiB volume, hence the minimum size.
+# Set it to an empty list for the lab shortcut: ten bind-mounted directories of
+# the root file system (vol1..vol10 under /var/local-disks).
+local_volume_devices: ["sdc", "sdd", "sde", "sdf"]
+local_volume_min_gib: 100
+local_volume_fstype: xfs
+local_volume_mount_prefix: /mnt/disks/vol
+
+# true skips the vCPU, RAM and disk size thresholds of the preflight checks
+# (every other check still runs). Meant for the contract test of hosts created
+# by a provisioning module (./deploy.sh tofu-verify): NKP must not be installed
+# on hosts that only pass this way.
+preflight_skip_sizing: false
+
+# Home and working directory of ansible_user on the jump host.
+nkp_user_home: "/home/{{ ansible_user }}"
+nkp_workdir: "{{ nkp_user_home }}/nkp"
+cluster_kubeconfig: "{{ nkp_workdir }}/{{ cluster_name }}.conf"
+
+# SSH identity used by Cluster API (from the jump host) to reach the nodes.
+# The key pair is generated when the file does not exist; an existing key that
+# is not an RSA 4096 key without passphrase is never overwritten (the run
+# stops). In inventory.ini write cluster_ssh_key_path as a literal absolute
+# path, for example a dedicated key such as /home/nutanix/.ssh/nkp_cluster_key.
+cluster_ssh_user: "{{ ansible_user }}"
+cluster_ssh_key_path: "{{ nkp_user_home }}/.ssh/id_rsa"
+
+# Name of the worker node pool. "nkp create cluster" always names it md-0.
+nkp_nodepool_name: "md-0"
