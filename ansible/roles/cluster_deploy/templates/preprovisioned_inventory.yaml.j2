@@ -1,0 +1,39 @@
+apiVersion: infrastructure.cluster.konvoy.d2iq.io/v1alpha1
+kind: PreprovisionedInventory
+metadata:
+  name: {{ cluster_name }}-control-plane
+  namespace: default
+  labels:
+    cluster.x-k8s.io/cluster-name: {{ cluster_name }}
+    clusterctl.cluster.x-k8s.io/move: ""
+spec:
+  hosts:
+{% for host in groups['control_plane'] %}
+  - address: {{ hostvars[host]['ansible_host'] }}
+{% endfor %}
+  sshConfig:
+    port: 22
+    user: {{ cluster_ssh_user }}
+    privateKeyRef:
+      name: {{ cluster_name }}-ssh-key
+      namespace: default
+---
+apiVersion: infrastructure.cluster.konvoy.d2iq.io/v1alpha1
+kind: PreprovisionedInventory
+metadata:
+  name: {{ cluster_name }}-{{ nkp_nodepool_name }}
+  namespace: default
+  labels:
+    cluster.x-k8s.io/cluster-name: {{ cluster_name }}
+    clusterctl.cluster.x-k8s.io/move: ""
+spec:
+  hosts:
+{% for host in groups['workers'] %}
+  - address: {{ hostvars[host]['ansible_host'] }}
+{% endfor %}
+  sshConfig:
+    port: 22
+    user: {{ cluster_ssh_user }}
+    privateKeyRef:
+      name: {{ cluster_name }}-ssh-key
+      namespace: default

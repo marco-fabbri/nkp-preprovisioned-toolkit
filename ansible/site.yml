@@ -1,0 +1,137 @@
+---
+# ==============================================================================
+# Master Deployment Playbook: Nutanix Kubernetes Platform (Preprovisioned)
+# ==============================================================================
+
+- name: Stage 0 - Preflight Verification & Health Checks
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - preflight
+    - always
+  roles:
+    - role: common
+    - role: preflight
+
+# Ansible only drops a failed host from the following plays; the cluster would
+# still be created with the complete inventory, failed hosts included. The gate
+# stops the whole run instead. It runs after the previous play has finished on
+# every host, so each host still reports all of its own failures first.
+- name: Gate - stop when a host failed the preflight checks
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: true
+  tags:
+    - always
+  tasks:
+    - name: Verify that no host failed or was unreachable in an earlier stage
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | difference(ansible_play_hosts) | length == 0
+        fail_msg: >-
+          Stopping before any host is changed: these hosts failed or were unreachable in an earlier
+          stage: {{ ansible_play_hosts_all | difference(ansible_play_hosts) | join(', ') }}.
+          Fix them (see the errors above) and run the command again.
+        quiet: true
+
+- name: Stage 1 - Setup Jump Host (Bastion & CAPI Bootstrap)
+  hosts: jump_host
+  become: true
+  gather_facts: true
+  tags:
+    - jump_host
+  roles:
+    - role: common
+    - role: jump_host
+
+- name: Stage 2 - Node Preparation (OS, Sysctl, CAPI Keys)
+  hosts: nkp_nodes
+  become: true
+  gather_facts: true
+  tags:
+    - node_prep
+  roles:
+    - role: common
+    - role: node_prep
+
+- name: Stage 2.5 - Apply and audit the CIS Level 1 aligned baseline
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - cis_hardening
+    - cis
+  roles:
+    - role: common
+  handlers:
+    - name: Restart sshd daemon
+      ansible.builtin.service:
+        name: "{{ 'sshd' if ansible_facts['os_family'] == 'RedHat' else 'ssh' }}"
+        state: restarted
+
+    - name: Reload augenrules
+      ansible.builtin.command:
+        cmd: augenrules --load
+      changed_when: true
+  tasks:
+    - name: Apply the CIS Level 1 aligned baseline (subset of controls)
+      when: os_profile | default('') is match('.*-cis$')
+      ansible.builtin.include_tasks: ../cis/ansible/tasks/hardening.yml
+
+    - name: Audit the CIS Level 1 aligned baseline (subset of controls)
+      when: os_profile | default('') is match('.*-cis$')
+      ansible.builtin.include_tasks: ../cis/ansible/tasks/audit.yml
+
+# Ansible only drops a failed host from the following plays; the cluster would
+# still be created with the complete inventory, failed hosts included. The gate
+# stops the whole run instead. It runs after the previous play has finished on
+# every host, so each host still reports all of its own failures first.
+- name: Gate - stop when a host failed node preparation or the CIS baseline
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: true
+  tags:
+    - always
+  tasks:
+    - name: Verify that no host failed or was unreachable in an earlier stage
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | difference(ansible_play_hosts) | length == 0
+        fail_msg: >-
+          Stopping before the cluster is created: these hosts failed or were unreachable in an earlier
+          stage: {{ ansible_play_hosts_all | difference(ansible_play_hosts) | join(', ') }}.
+          Fix them (see the errors above) and run the command again.
+        quiet: true
+
+- name: Stage 3 - Deploy Self-Managed NKP Cluster
+  hosts: jump_host
+  become: true
+  gather_facts: true
+  tags:
+    - cluster_deploy
+  roles:
+    - role: common
+    - role: cluster_deploy
+
+- name: Stage 4 - Storage & Networking (Ceph & MetalLB Ingress)
+  hosts: jump_host
+  become: true
+  gather_facts: true
+  tags:
+    - storage_network
+  roles:
+    - role: common
+    - role: storage_network
+
+- name: Stage 5 - Deploy Kommander Platform Services
+  hosts: jump_host
+  become: true
+  gather_facts: true
+  tags:
+    - kommander_deploy
+  roles:
+    - role: common
+    - role: kommander_deploy

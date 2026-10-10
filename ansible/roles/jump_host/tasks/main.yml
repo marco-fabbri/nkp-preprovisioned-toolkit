@@ -1,0 +1,251 @@
+---
+# ==============================================================================
+# Role: jump_host - Setup Docker CE, nkp CLI, kubectl, and CAPI SSH Keypair
+# ==============================================================================
+
+- name: Install base system dependencies (RedHat / Rocky)
+  when: ansible_facts['os_family'] == 'RedHat'
+  ansible.builtin.dnf:
+    name:
+      - yum-utils
+      - curl
+      - tar
+      - git
+      - iptables
+      - iputils
+      - bash-completion
+    state: present
+
+- name: Install base system dependencies (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - tar
+      - git
+      - iptables
+      - iputils-ping
+      - bash-completion
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Configure Docker CE repository (RedHat / Rocky)
+  when: ansible_facts['os_family'] == 'RedHat'
+  ansible.builtin.yum_repository:
+    name: docker-ce-stable
+    file: docker-ce
+    description: Docker CE Stable - $basearch
+    baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+    gpgcheck: true
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: true
+
+- name: Configure Docker CE repository (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  block:
+    - name: Ensure keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker official GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Configure Docker deb822 repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.sources
+        content: |
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: {{ ansible_facts['distribution_release'] }}
+          Components: stable
+          Signed-By: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+- name: Install Docker CE (RedHat / Rocky)
+  when: ansible_facts['os_family'] == 'RedHat'
+  ansible.builtin.dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+    state: present
+
+- name: Install Docker CE (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+    state: present
+    update_cache: true
+
+- name: Start and enable Docker daemon
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+
+# The salt is deterministic per host, so the hash (and the task) is stable
+# across runs. An empty vm_default_password leaves the password untouched.
+- name: Add the login user to the docker group and set the system password
+  ansible.builtin.user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: true
+    password: >-
+      {{ (vm_default_password | password_hash('sha512', vm_default_password_salt))
+         if (vm_default_password | default('') | length > 0) else omit }}
+
+- name: Reset SSH connection so docker group membership takes effect
+  ansible.builtin.meta: reset_connection
+
+# sshd uses the first value it reads: the 01- prefix sorts before the drop-ins
+# written by cloud-init and by the OS installer.
+- name: Set PasswordAuthentication in OpenSSH
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/01-nkp-password-auth.conf
+    content: "PasswordAuthentication {{ 'yes' if ssh_password_authentication | bool else 'no' }}\n"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart sshd daemon
+
+- name: Remove the drop-in written by earlier revisions of this toolkit
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d/01-enable-password.conf
+    state: absent
+  notify: Restart sshd daemon
+
+- name: Check for an installed kubectl binary
+  ansible.builtin.stat:
+    path: /usr/local/bin/kubectl
+  register: jump_host_kubectl_stat
+
+# Probe only: a missing or broken binary is handled by the install task below.
+- name: Read the installed kubectl client version
+  when: jump_host_kubectl_stat.stat.exists
+  ansible.builtin.command:
+    cmd: /usr/local/bin/kubectl version --client -o json
+  register: jump_host_kubectl_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install the kubectl binary at the version set in kubectl_version
+  when: >-
+    not jump_host_kubectl_stat.stat.exists
+    or jump_host_kubectl_installed.rc != 0
+    or (jump_host_kubectl_installed.stdout | from_json).clientVersion.gitVersion != kubectl_version
+  ansible.builtin.get_url:
+    url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+    checksum: "sha256:https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl.sha256"
+    dest: /usr/local/bin/kubectl
+    owner: root
+    group: root
+    mode: '0755'
+    force: true
+
+# One directory per NKP release and /usr/local/bin/nkp pointing at the release
+# in use: a later release is installed next to the current one (an upgrade
+# needs the CLI of the target release) and the previous one stays for
+# diagnosis. "creates" keeps the bundle from being copied again on every run.
+- name: Create the NKP CLI directory for release {{ nkp_version }}
+  ansible.builtin.file:
+    path: "{{ nkp_cli_install_dir }}/{{ nkp_version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the NKP CLI from the bundle
+  ansible.builtin.unarchive:
+    src: "{{ playbook_dir }}/../{{ nkp_archive_local_path }}"
+    dest: "{{ nkp_cli_install_dir }}/{{ nkp_version }}"
+    include:
+      - nkp
+    creates: "{{ nkp_cli_install_dir }}/{{ nkp_version }}/nkp"
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Point /usr/local/bin/nkp at release {{ nkp_version }}
+  ansible.builtin.file:
+    src: "{{ nkp_cli_install_dir }}/{{ nkp_version }}/nkp"
+    dest: /usr/local/bin/nkp
+    state: link
+    force: true
+
+- name: Read the NKP CLI version on the Jump Host
+  ansible.builtin.command:
+    cmd: /usr/local/bin/nkp version
+  register: jump_host_nkp_version
+  changed_when: false
+
+- name: Verify the NKP CLI is release {{ nkp_version }}
+  ansible.builtin.assert:
+    that:
+      - "'nkp: v' ~ nkp_version in jump_host_nkp_version.stdout_lines"
+    fail_msg: >-
+      /usr/local/bin/nkp reports {{ jump_host_nkp_version.stdout_lines | join(', ') }},
+      not nkp: v{{ nkp_version }}: the bundle in {{ nkp_archive_local_path }} is not release
+      {{ nkp_version }}.
+    quiet: true
+
+# Both CLIs generate their own bash completion; bash-completion (installed
+# above) loads every file in /etc/bash_completion.d/ for interactive shells.
+- name: Generate the bash completion of the nkp and kubectl CLIs
+  ansible.builtin.command:
+    argv: ["/usr/local/bin/{{ item }}", "completion", "bash"]
+  loop: [nkp, kubectl]
+  register: jump_host_completion
+  changed_when: false
+
+- name: Install the bash completion of the nkp and kubectl CLIs
+  ansible.builtin.copy:
+    content: "{{ item.stdout }}\n"
+    dest: "/etc/bash_completion.d/{{ item.item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ jump_host_completion.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create the SSH directory for the cluster keypair
+  ansible.builtin.file:
+    path: "{{ cluster_ssh_key_path | dirname }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0700'
+
+# regenerate=fail: a missing key is created, a matching key is kept, and an
+# existing key of another type or size (for example the personal id_rsa of the
+# user) stops the run instead of being overwritten.
+- name: Generate SSH keypair for CAPI/Konvoy
+  community.crypto.openssh_keypair:
+    path: "{{ cluster_ssh_key_path }}"
+    type: rsa
+    size: 4096
+    regenerate: fail
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+
+- name: Read generated public key from Jump Host
+  ansible.builtin.slurp:
+    src: "{{ cluster_ssh_key_path }}.pub"
+  register: jump_host_pubkey_raw
+
+- name: Authorize public key on Jump Host itself
+  ansible.posix.authorized_key:
+    user: "{{ ansible_user }}"
+    state: present
+    key: "{{ jump_host_pubkey_raw.content | b64decode | trim }}"

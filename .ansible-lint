@@ -1,0 +1,10 @@
+---
+profile: production
+exclude_paths:
+  - .github/
+skip_list:
+  # Shared variables (inventory.ini and role "common") are read by several roles
+  # and playbooks, so they cannot carry a single role prefix.
+  - var-naming[no-role-prefix]
+  # The CIS audit reads service state with "systemctl is-active" (read-only probe).
+  - command-instead-of-module

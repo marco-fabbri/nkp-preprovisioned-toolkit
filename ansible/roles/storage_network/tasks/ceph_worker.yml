@@ -1,0 +1,118 @@
+---
+# Runs from the jump host play, once per worker; "item" is the inventory name
+# of the worker.
+#
+# Kommander installs Rook Ceph in host storage mode (see kommander_deploy):
+# every worker gives Ceph the device selected by ceph_osd_device (by kernel
+# name, or by /dev/disk/by-* link for an absolute path). That device is either
+# a raw disk you provide or, as a lab shortcut, a loop device backed by a
+# sparse image file on the root disk.
+
+# --- Lab shortcut: loop device ------------------------------------------------
+- name: Create sparse image file for the Ceph OSD on {{ item }}
+  when: ceph_osd_device | length == 0
+  delegate_to: "{{ item }}"
+  become: true
+  ansible.builtin.command:
+    cmd: "truncate -s {{ storage_network_ceph_image_size }} {{ storage_network_ceph_image_path }}"
+    creates: "{{ storage_network_ceph_image_path }}"
+
+# A fixed device name keeps the Ceph device filter stable across reboots; the
+# unit attaches the image only when it is not attached yet.
+- name: Create systemd unit for automatic loop device attach on {{ item }}
+  when: ceph_osd_device | length == 0
+  delegate_to: "{{ item }}"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/attach-ceph-loop.service
+    content: |
+      [Unit]
+      Description=Attach Ceph Loop Device for Rook
+      After=local-fs.target
+      DefaultDependencies=no
+
+      [Service]
+      Type=oneshot
+      Environment=IMG={{ storage_network_ceph_image_path }}
+      Environment=DEV=/dev/{{ storage_network_ceph_loop_name }}
+      ExecStart=/bin/sh -c 'losetup -j "$IMG" | grep -q . || losetup "$DEV" "$IMG"'
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+  register: storage_network_ceph_unit
+
+- name: Reload systemd and start attach-ceph-loop service on {{ item }}
+  when: ceph_osd_device | length == 0
+  delegate_to: "{{ item }}"
+  become: true
+  ansible.builtin.systemd:
+    name: attach-ceph-loop
+    state: "{{ 'restarted' if storage_network_ceph_unit is changed else 'started' }}"
+    enabled: true
+    daemon_reload: true
+
+# --- Raw disk: resolve the configured value on this worker ----------------------
+# Kernel names can differ from one worker to the next and from one boot to the
+# next: the value is resolved on the worker (readlink -f) and the checks below
+# use the kernel name it designates now. The run stops when it resolves to no
+# disk, to a local volume disk or to the disk holding /.
+- name: Resolve the data disks of {{ item }}
+  when: ceph_osd_device | length > 0
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: data_disks
+  vars:
+    common_data_disks_host: "{{ item }}"
+
+# --- Both modes: the device must exist and must not be in use -------------------
+# A Ceph signature is only accepted once this cluster has a CephCluster: Rook
+# skips a device whose signature belongs to another cluster, without any error.
+- name: Check whether a Rook CephCluster already exists
+  ansible.builtin.command:
+    argv: ['kubectl', '--kubeconfig', "{{ cluster_kubeconfig }}", 'get', 'cephclusters.ceph.rook.io', '-A', '--ignore-not-found', '-o', 'name']
+  become: false
+  register: storage_network_cephcluster
+  changed_when: false
+  failed_when: false
+
+- name: Read the Ceph OSD device on {{ item }}
+  delegate_to: "{{ item }}"
+  become: true
+  ansible.builtin.command:
+    argv: ['lsblk', '-n', '-b', '-o', 'NAME,TYPE,SIZE,FSTYPE,PTTYPE,MOUNTPOINT', "/dev/{{ storage_network_ceph_device }}"]
+  register: storage_network_ceph_lsblk
+  changed_when: false
+  failed_when: false
+
+# One line (no partitions), no partition table, no mount point, and either no
+# signature or the one Ceph wrote itself on an earlier run of this cluster.
+- name: Assert the Ceph OSD device is a raw, unused device on {{ item }}
+  vars:
+    storage_network_lsblk_fields: "{{ (storage_network_ceph_lsblk.stdout_lines | default(['']) | first | default('')).split() }}"
+    storage_network_ceph_signature: "{{ storage_network_lsblk_fields | length == 4 and storage_network_lsblk_fields[3] == 'ceph_bluestore' }}"
+    storage_network_cephcluster_exists: "{{ storage_network_cephcluster.stdout | default('') | trim | length > 0 }}"
+    storage_network_ceph_label: >-
+      {{ (ceph_osd_device ~ ' (/dev/' ~ storage_network_ceph_device ~ ')') if ceph_osd_device | length > 0
+         else '/dev/' ~ storage_network_ceph_device }}
+  ansible.builtin.assert:
+    that:
+      - storage_network_ceph_lsblk.rc == 0
+      - storage_network_ceph_lsblk.stdout_lines | length == 1
+      - storage_network_lsblk_fields | length in [3, 4]
+      - storage_network_lsblk_fields | length == 3 or storage_network_ceph_signature | bool
+      - storage_network_lsblk_fields | length == 3 or storage_network_cephcluster_exists | bool
+      - storage_network_lsblk_fields[2] | int >= storage_network_ceph_min_bytes | int
+    fail_msg: >-
+      {{ storage_network_ceph_label ~ ' on ' ~ item ~ ' carries a Ceph signature but this cluster has no '
+         ~ 'CephCluster yet: it belongs to a previous installation. Clear it by hand, then re-run. Raw disk: '
+         ~ 'wipefs --all /dev/' ~ storage_network_ceph_device ~ '. Loop device: systemctl disable --now attach-ceph-loop; '
+         ~ 'losetup -d /dev/' ~ storage_network_ceph_loop_name ~ '; rm ' ~ storage_network_ceph_image_path
+         ~ '. In both cases also rm -rf /var/lib/rook.'
+         if (storage_network_ceph_signature | bool) and not (storage_network_cephcluster_exists | bool)
+         else storage_network_ceph_label ~ ' on ' ~ item ~ ' cannot be used as Ceph OSD device: it must exist, '
+              ~ 'be at least ' ~ ((storage_network_ceph_min_bytes | int / 1073741824) | int) ~ ' GiB, and have no partitions, '
+              ~ 'no partition table (wipefs --all or sgdisk --zap-all clears it), no file system and no mount point.' }}
+      lsblk reported:
+      {{ storage_network_ceph_lsblk.stdout | default('') }} {{ storage_network_ceph_lsblk.stderr | default('') }}

@@ -1,0 +1,516 @@
+---
+# ==============================================================================
+# Playbook: add_worker.yml - Scale-out of a worker node through Cluster API
+# ==============================================================================
+# Usage (normally called by scripts/add-node.sh):
+#   ansible-playbook -i inventory.ini ansible/add_worker.yml \
+#     -e '{"worker_ip": "10.10.10.89", "worker_name": "nkp-worker-03"}'
+#
+# Flow: validate input -> preflight and OS preparation exactly like the original
+# workers (any failure stops the run before the cluster is touched) -> verify the
+# node pool has as many replicas as hosts -> add the IP to the worker
+# PreprovisionedInventory -> scale the MachineDeployment by +1 (the CAPI
+# preprovisioned provider installs containerd/kubelet and joins the node) ->
+# wait for the Node to be Ready -> persist the host in inventory.ini.
+#
+# The new host is reached with the SSH user of the existing workers: Cluster API
+# uses one SSH user for the whole node pool.
+#
+# Optional extra vars:
+#   worker_name        hostname to set on the new node (RFC 1123 label)
+#   nkp_inventory_name PreprovisionedInventory to extend (default: MachineDeployment name)
+#   day2_wait_timeout  seconds to wait for the Node to become Ready (default: 1800)
+# ==============================================================================
+
+- name: Validate input and read cluster state
+  hosts: jump_host
+  gather_facts: false
+  become: false
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  vars:
+    day2_ipv4_regex: '^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
+    day2_kubectl: ['kubectl', '--kubeconfig', "{{ cluster_kubeconfig }}"]
+  roles:
+    - role: common
+  tasks:
+    - name: Verify worker_ip is a valid IPv4 address
+      ansible.builtin.assert:
+        that:
+          - worker_ip is defined
+          - worker_ip is string
+          - worker_ip is match(day2_ipv4_regex)
+        fail_msg: "Parameter 'worker_ip' is mandatory and must be a dotted IPv4 address, for example 10.10.10.89."
+        quiet: true
+
+    - name: Verify worker_name is a valid RFC 1123 label
+      when: worker_name is defined
+      ansible.builtin.assert:
+        that:
+          - worker_name is string
+          - worker_name is match('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')
+        fail_msg: "Parameter 'worker_name' must be an RFC 1123 label (lowercase letters, digits and '-', at most 63 characters)."
+        quiet: true
+
+    - name: Set new worker inventory name
+      ansible.builtin.set_fact:
+        day2_worker_name: "{{ worker_name | default('nkp-worker-' ~ worker_ip.split('.')[-1]) }}"
+        day2_worker_user: "{{ hostvars[(groups['workers'] | default([]) + groups['control_plane'])[0]]['ansible_user'] }}"
+
+    - name: Check whether worker_ip falls inside the MetalLB address pool
+      ansible.builtin.set_fact:
+        day2_ip_in_metallb_range: >-
+          {%- macro ip2int(ip) -%}
+          {%- set o = (ip | trim).split('.') | map('int') | list -%}
+          {{ o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3] }}{%- endmacro -%}
+          {%- set w = ip2int(worker_ip) | int -%}
+          {%- set ns = namespace(hit=false) -%}
+          {%- for r in (metallb_ip_range | default('') | string).split(',') | map('trim') | select | list -%}
+          {%- if '-' in r -%}
+          {%- if (ip2int(r.split('-')[0]) | int) <= w and w <= (ip2int(r.split('-')[1]) | int) -%}
+          {%- set ns.hit = true -%}
+          {%- endif -%}
+          {%- elif '/' in r -%}
+          {%- set size = 2 ** (32 - (r.split('/')[1] | int)) -%}
+          {%- if (w // size) == ((ip2int(r.split('/')[0]) | int) // size) -%}
+          {%- set ns.hit = true -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ ns.hit }}
+
+    - name: Verify worker_ip and name do not collide with existing addresses
+      ansible.builtin.assert:
+        that:
+          - worker_ip != control_plane_vip
+          - worker_ip not in (groups['all'] | map('extract', hostvars) | map(attribute='ansible_host', default='') | list)
+          - day2_worker_name not in groups['all']
+          - not (day2_ip_in_metallb_range | bool)
+        fail_msg: >-
+          {{ worker_ip }} / {{ day2_worker_name }} cannot be used: the IP must not be the control plane VIP
+          ({{ control_plane_vip }}), must not belong to a host already in the inventory, must be outside the
+          MetalLB pool ({{ metallb_ip_range | default('not set') }}), and the name must not be an existing inventory host.
+        quiet: true
+
+    - name: Check cluster kubeconfig on the jump host
+      ansible.builtin.stat:
+        path: "{{ cluster_kubeconfig }}"
+      register: day2_kubeconfig_stat
+
+    - name: Verify cluster kubeconfig exists
+      ansible.builtin.assert:
+        that:
+          - day2_kubeconfig_stat.stat.exists
+        fail_msg: "{{ cluster_kubeconfig }} not found on the jump host. Deploy the cluster first (./deploy.sh install)."
+        quiet: true
+
+    # One line per node: "<InternalIP> <Ready status> <name>"
+    - name: Read current cluster nodes
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'nodes', '-o', day2_nodes_jsonpath] }}"
+      vars:
+        day2_nodes_jsonpath: "jsonpath={range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}\
+          {.status.conditions[?(@.type==\"Ready\")].status}{\" \"}{.metadata.name}{\"\\n\"}{end}"
+      register: day2_nodes_raw
+      changed_when: false
+
+    - name: Register current cluster nodes
+      ansible.builtin.set_fact:
+        day2_other_node_names: >-
+          {{ day2_nodes_raw.stdout_lines | reject('match', '^' ~ (worker_ip | regex_escape) ~ ' ')
+             | map('split', ' ') | map('last') | list }}
+        day2_already_joined: >-
+          {{ day2_nodes_raw.stdout_lines | select('match', '^' ~ (worker_ip | regex_escape) ~ ' ') | list | length > 0 }}
+
+    - name: Locate the Cluster API objects of this cluster
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'machinedeployments.cluster.x-k8s.io', '-A', '-o', 'json'] }}"
+      register: day2_md_raw
+      changed_when: false
+
+    - name: Select the worker MachineDeployment
+      ansible.builtin.set_fact:
+        day2_md_matches: "{{ day2_md_matches | default([]) + [item] }}"
+      loop: "{{ (day2_md_raw.stdout | from_json)['items'] }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+      when:
+        - item.spec.clusterName == cluster_name
+        - item.metadata.name in [nkp_nodepool_name, cluster_name ~ '-' ~ nkp_nodepool_name]
+
+    - name: Verify exactly one worker MachineDeployment was found
+      ansible.builtin.assert:
+        that:
+          - day2_md_matches | default([]) | length == 1
+        fail_msg: >-
+          Expected exactly one MachineDeployment named '{{ cluster_name }}-{{ nkp_nodepool_name }}' (or
+          '{{ nkp_nodepool_name }}') for cluster '{{ cluster_name }}', found {{ day2_md_matches | default([]) | length }}.
+          Check 'kubectl get machinedeployments -A' and set nkp_nodepool_name accordingly.
+        quiet: true
+
+    - name: Register worker MachineDeployment
+      ansible.builtin.set_fact:
+        day2_md_name: "{{ day2_md_matches[0].metadata.name }}"
+        day2_md_namespace: "{{ day2_md_matches[0].metadata.namespace }}"
+        day2_inventory_name: "{{ nkp_inventory_name | default(day2_md_matches[0].metadata.name) }}"
+
+    - name: Verify the worker PreprovisionedInventory exists
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'preprovisionedinventory', day2_inventory_name, '-n', day2_md_namespace, '-o', 'name'] }}"
+      changed_when: false
+
+    - name: Add new host to the in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ day2_worker_name }}"
+        ansible_host: "{{ worker_ip }}"
+        ansible_user: "{{ day2_worker_user }}"
+        groups:
+          - new_workers
+          - workers
+          - nkp_nodes
+
+# Same checks as "./deploy.sh check" (OS profile, sizing, CIDR overlap), with the
+# new host already in group workers. The jump host is included because the role
+# reads the cluster kubeconfig there to skip the fresh-cluster checks.
+# any_errors_fatal: a failed check on the new host must stop the whole run, not
+# only drop the host and let the jump host go on to the Cluster API steps.
+- name: Preflight checks on the new worker
+  hosts: jump_host:new_workers
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: common
+    - role: preflight
+  tasks:
+    # The Kubernetes node name is the OS hostname: two nodes with the same hostname cannot coexist.
+    - name: Verify the node hostname is not already used in the cluster
+      when: inventory_hostname in groups['new_workers']
+      ansible.builtin.assert:
+        that:
+          - (worker_name | default(ansible_facts['hostname'])) not in day2_other_node_names
+          - worker_name is defined or ansible_facts['fqdn'] not in day2_other_node_names
+        fail_msg: >-
+          A cluster node named '{{ worker_name | default(ansible_facts['hostname']) }}' already exists.
+          Pass a unique hostname with --name (worker_name).
+        quiet: true
+      vars:
+        day2_other_node_names: "{{ hostvars[groups['jump_host'][0]]['day2_other_node_names'] }}"
+
+- name: Prepare operating system on the new worker
+  hosts: new_workers
+  gather_facts: true
+  become: true
+  handlers:
+    - name: Restart sshd daemon
+      ansible.builtin.service:
+        name: "{{ 'sshd' if ansible_facts['os_family'] == 'RedHat' else 'ssh' }}"
+        state: restarted
+
+    - name: Reload augenrules
+      ansible.builtin.command:
+        cmd: augenrules --load
+      changed_when: true
+  roles:
+    - role: common
+    - role: node_prep
+  tasks:
+    - name: Set hostname requested with worker_name
+      when: worker_name is defined
+      block:
+        - name: Set system hostname
+          ansible.builtin.hostname:
+            name: "{{ worker_name }}"
+
+        - name: Map hostname to the loopback address in /etc/hosts
+          ansible.builtin.lineinfile:
+            path: /etc/hosts
+            regexp: '^127\.0\.1\.1\s'
+            line: "127.0.1.1 {{ worker_name }}"
+
+        - name: Check for cloud-init configuration
+          ansible.builtin.stat:
+            path: /etc/cloud/cloud.cfg.d
+          register: day2_cloud_cfg_dir
+
+        # Without this, cloud-init restores the template hostname at the next boot.
+        - name: Keep the hostname across reboots when cloud-init is installed
+          when: day2_cloud_cfg_dir.stat.exists
+          ansible.builtin.copy:
+            dest: /etc/cloud/cloud.cfg.d/99-nkp-preserve-hostname.cfg
+            content: "preserve_hostname: true\n"
+            mode: '0644'
+
+    - name: Apply the CIS Level 1 aligned baseline (subset of controls)
+      when: os_profile | default('') is match('.*-cis$')
+      ansible.builtin.include_tasks: ../cis/ansible/tasks/hardening.yml
+
+    - name: Apply pending handlers before the preparation is declared complete
+      ansible.builtin.meta: flush_handlers
+
+    # Checked by the gate below: only a host that went through every task of
+    # this play may be handed to Cluster API.
+    - name: Record that the operating system preparation completed
+      ansible.builtin.set_fact:
+        day2_os_prepared: true
+
+# The cluster SSH key is authorised by the first task of node_prep, so a later
+# failure (packages, firewall, CIS baseline) would still pass the SSH test of
+# the next play. Ansible only drops a failed host from the following plays: the
+# gate stops the run instead, before anything is changed in the cluster.
+- name: Gate - stop when the preparation of the new worker did not complete
+  hosts: jump_host:new_workers
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify that the new worker was prepared completely
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | difference(ansible_play_hosts) | length == 0
+          - groups['new_workers'] | default([]) | length == 1
+          - hostvars[groups['new_workers'][0]]['day2_os_prepared'] | default(false) | bool
+        fail_msg: >-
+          The preparation of the new worker {{ worker_ip }} did not complete (see the errors above).
+          Nothing was changed in the cluster: fix the host and run the command again.
+        quiet: true
+
+- name: Join the new worker through Cluster API
+  hosts: jump_host
+  gather_facts: false
+  become: false
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  vars:
+    day2_kubectl: ['kubectl', '--kubeconfig', "{{ cluster_kubeconfig }}"]
+    day2_inventory_args: ['preprovisionedinventory', "{{ day2_inventory_name }}", '-n', "{{ day2_md_namespace }}"]
+    day2_md_args: ['machinedeployments.cluster.x-k8s.io', "{{ day2_md_name }}", '-n', "{{ day2_md_namespace }}"]
+    day2_node_line_regex: "{{ '^' ~ (worker_ip | regex_escape) ~ ' True ' }}"
+    day2_nodes_jsonpath: "jsonpath={range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\" \"}\
+      {.status.conditions[?(@.type==\"Ready\")].status}{\" \"}{.metadata.name}{\"\\n\"}{end}"
+  roles:
+    - role: common
+  tasks:
+    - name: Setup the Ceph OSD device on the new worker
+      ansible.builtin.include_role:
+        name: storage_network
+        tasks_from: ceph_worker
+      loop: "{{ groups['new_workers'] }}"
+      loop_control:
+        label: "{{ item }} ({{ worker_ip }})"
+
+    # The CAPI preprovisioned provider connects with this key and needs passwordless sudo.
+    - name: Test SSH and sudo from the jump host to the new worker with the cluster key
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=no
+          - -o
+          - UserKnownHostsFile=/dev/null
+          - -i
+          - "{{ cluster_ssh_key_path }}"
+          - "{{ cluster_ssh_user }}@{{ worker_ip }}"
+          - sudo -n true
+      changed_when: false
+
+    - name: Read hosts of the worker PreprovisionedInventory
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get'] + day2_inventory_args + ['-o', 'jsonpath={.spec.hosts[*].address}'] }}"
+      register: day2_inventory_hosts_raw
+      changed_when: false
+
+    - name: Read current replicas of the worker MachineDeployment
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get'] + day2_md_args + ['-o', 'jsonpath={.spec.replicas}'] }}"
+      register: day2_md_replicas_raw
+      changed_when: false
+
+    - name: Register the state of the node pool
+      ansible.builtin.set_fact:
+        day2_replicas: "{{ day2_md_replicas_raw.stdout | int }}"
+        day2_inventory_hosts: "{{ day2_inventory_hosts_raw.stdout.split() }}"
+        day2_ip_listed: "{{ worker_ip in day2_inventory_hosts_raw.stdout.split() }}"
+        day2_hosts_without_node: >-
+          {{ day2_inventory_hosts_raw.stdout.split()
+             | difference(day2_nodes_raw.stdout_lines | map('split', ' ') | map('first') | list)
+             | difference([worker_ip]) }}
+
+    # A scale does not target an address: the provider claims any free host of
+    # the inventory. The +1 below joins exactly the new IP only if every other
+    # listed host is already claimed, that is replicas == hosts before the change.
+    # On a re-run the IP is already listed and the pool may already be scaled.
+    - name: Verify the node pool has as many replicas as hosts in its inventory
+      when: not (day2_already_joined | bool)
+      ansible.builtin.assert:
+        that:
+          - >-
+            (day2_replicas | int) == (day2_inventory_hosts | length)
+            or ((day2_ip_listed | bool) and (day2_replicas | int) == (day2_inventory_hosts | length) - 1)
+        fail_msg: >-
+          Node pool {{ day2_md_namespace }}/{{ day2_md_name }} has {{ day2_replicas }} replicas, but
+          PreprovisionedInventory {{ day2_inventory_name }} lists {{ day2_inventory_hosts | length }} hosts
+          ({{ day2_inventory_hosts | join(', ') }}). Scaling now could join a different host than {{ worker_ip }}.
+          Listed addresses without a cluster node:
+          {{ day2_hosts_without_node | join(', ') if day2_hosts_without_node | length > 0 else 'none' }}.
+          Remove each stale address with './scripts/remove-node.sh --cleanup-only --ip <IP>' (or roll back a failed
+          add-worker as described in README.md), then run this command again. Nothing was changed in the cluster.
+        quiet: true
+
+    - name: Append the new IP to spec.hosts of the PreprovisionedInventory
+      when: not (day2_ip_listed | bool)
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['patch'] + day2_inventory_args + ['--type=json', '-p', day2_patch | to_json] }}"
+      vars:
+        day2_patch:
+          - op: add
+            path: /spec/hosts/-
+            value:
+              address: "{{ worker_ip }}"
+      changed_when: true
+
+    # On a re-run after a timeout the replicas already cover every inventory host: do not scale twice.
+    - name: Decide whether the node pool must be scaled
+      ansible.builtin.set_fact:
+        day2_scale_needed: >-
+          {{ not (day2_already_joined | bool)
+             and (day2_replicas | int) < ((day2_inventory_hosts + [worker_ip]) | unique | length) }}
+
+    # --current-replicas makes the scale fail instead of scaling twice if the pool changed meanwhile.
+    - name: Scale the worker MachineDeployment by +1
+      when: day2_scale_needed | bool
+      ansible.builtin.command:
+        argv: >-
+          {{ day2_kubectl + ['scale'] + day2_md_args
+             + ['--current-replicas=' ~ day2_replicas, '--replicas=' ~ ((day2_replicas | int) + 1)] }}
+      changed_when: true
+
+    - name: Wait for the new worker to join and become Ready
+      block:
+        - name: Wait for a Ready node with InternalIP {{ worker_ip }}
+          ansible.builtin.command:
+            argv: "{{ day2_kubectl + ['get', 'nodes', '-o', day2_nodes_jsonpath] }}"
+          register: day2_wait_node
+          until: day2_wait_node.stdout_lines | select('match', day2_node_line_regex) | list | length == 1
+          retries: "{{ ((day2_wait_timeout | default(1800) | int) / 20) | int }}"
+          delay: 20
+          changed_when: false
+      rescue:
+        - name: Collect Machine status for diagnosis
+          ansible.builtin.command:
+            argv: "{{ day2_kubectl + ['get', 'machines.cluster.x-k8s.io', '-n', day2_md_namespace, '-o', 'wide'] }}"
+          register: day2_machines_diag
+          changed_when: false
+          failed_when: false
+
+        - name: Report that the node did not become Ready
+          vars:
+            day2_replicas_before: "{{ ((day2_inventory_hosts + [worker_ip]) | unique | length) - 1 }}"
+          ansible.builtin.fail:
+            msg:
+              - "No Ready node with InternalIP {{ worker_ip }} within {{ day2_wait_timeout | default(1800) }} seconds."
+              - "The IP is in PreprovisionedInventory {{ day2_md_namespace }}/{{ day2_inventory_name }}; {{ day2_md_name }} was scaled."
+              - "inventory.ini was NOT modified."
+              - "Inspect the Machine in phase Provisioning: kubectl describe machine -n {{ day2_md_namespace }} <name>"
+              - "To continue: fix the host and re-run this command (it resumes from the wait without scaling again)."
+              - "To roll back, on the jump host (kubectl --kubeconfig {{ cluster_kubeconfig }}):"
+              - "  1. kubectl annotate machine <Machine without a node> -n {{ day2_md_namespace }} cluster.x-k8s.io/delete-machine=yes"
+              - "  2. kubectl scale machinedeployment {{ day2_md_name }} -n {{ day2_md_namespace }} --replicas={{ day2_replicas_before }}"
+              - "  3. wait until that Machine is gone (kubectl get machines -n {{ day2_md_namespace }})"
+              - "  4. ./scripts/remove-node.sh --cleanup-only --ip {{ worker_ip }}"
+              - "{{ day2_machines_diag.stdout_lines | default([]) }}"
+
+    - name: Register the Kubernetes name of the new node
+      ansible.builtin.set_fact:
+        day2_node_name: >-
+          {{ (day2_wait_node.stdout_lines | select('match', day2_node_line_regex) | list | first).split(' ') | last }}
+
+    # Rook does not prepare an OSD on a node that joins later until its operator
+    # reconciles from scratch (seen on a lab cluster): restart the operator.
+    # Best effort: the outcome is reported, a failure does not stop the run.
+    - name: Find the Rook Ceph operator
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'deployments', '-A', '--field-selector', 'metadata.name=rook-ceph-operator',
+                                  '-o', day2_operator_jsonpath, '--ignore-not-found'] }}"
+      vars:
+        day2_operator_jsonpath: 'jsonpath={range .items[*]}{.metadata.namespace}{"\n"}{end}'
+      register: day2_rook_operator
+      changed_when: false
+      failed_when: false
+
+    - name: Restart the Rook Ceph operator so the new worker gets an OSD
+      when: day2_rook_operator.rc == 0 and day2_rook_operator_ns | length > 0
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['-n', day2_rook_operator_ns, 'rollout', 'restart', 'deployment/rook-ceph-operator'] }}"
+      vars:
+        day2_rook_operator_ns: "{{ day2_rook_operator.stdout_lines | default([]) | first | default('') | trim }}"
+      register: day2_rook_restart
+      changed_when: true
+      failed_when: false
+
+    - name: Register the outcome of the Rook Ceph operator restart
+      vars:
+        day2_rook_operator_count: "{{ day2_rook_operator.stdout_lines | default([]) | select | list | length }}"
+        day2_rook_operator_ns: "{{ day2_rook_operator.stdout_lines | default([]) | first | default('') | trim }}"
+      ansible.builtin.set_fact:
+        day2_rook_restart_outcome: >-
+          {{ 'not found: no rook-ceph-operator deployment, no OSD is created on the new worker'
+             if day2_rook_restart is skipped
+             else (('restarted in namespace ' ~ day2_rook_operator_ns
+                    ~ ('' if day2_rook_operator_count | int == 1
+                       else ' only (' ~ (day2_rook_operator_count | int - 1) ~ ' other rook-ceph-operator not restarted)')
+                    ~ '; the new worker gets an OSD in a few minutes')
+                   if day2_rook_restart.rc == 0
+                   else ('NOT restarted (rc ' ~ day2_rook_restart.rc ~ ': ' ~ (day2_rook_restart.stderr | default('') | trim)
+                         ~ '). Restart it by hand so the worker gets an OSD: kubectl --kubeconfig ' ~ cluster_kubeconfig
+                         ~ ' -n ' ~ day2_rook_operator_ns ~ ' rollout restart deployment/rook-ceph-operator')) }}
+
+    - name: Persist the new worker in inventory.ini
+      delegate_to: localhost
+      become: false
+      vars:
+        day2_inventory_text: "{{ lookup('ansible.builtin.file', inventory_file) }}"
+        day2_last_worker: "{{ groups['workers'] | reject('in', groups['new_workers']) | list | last | default('') }}"
+        day2_last_worker_regex: "{{ '^' ~ (day2_last_worker | regex_escape) ~ '\\s' }}"
+        day2_host_line: "{{ day2_worker_name }} ansible_host={{ worker_ip }} ansible_user={{ day2_worker_user }}"
+      block:
+        - name: Add host line under [workers]
+          when:
+            - inventory_file is defined
+            - day2_inventory_text is search('(?m)^\[workers\]\s*$')
+          ansible.builtin.lineinfile:
+            path: "{{ inventory_file }}"
+            regexp: "{{ '^' ~ (day2_worker_name | regex_escape) ~ '\\s' }}"
+            line: "{{ day2_host_line }}"
+            insertafter: >-
+              {{ day2_last_worker_regex
+                 if (day2_last_worker | length > 0 and day2_inventory_text is search('(?m)' ~ day2_last_worker_regex))
+                 else '^\[workers\]' }}
+          register: day2_inventory_persist
+
+        - name: Ask for manual inventory update when the inventory is not an INI file with a [workers] section
+          when: day2_inventory_persist is skipped
+          ansible.builtin.debug:
+            msg: "Add this line to the workers group of your inventory: {{ day2_host_line }}"
+
+    - name: Print updated node list
+      ansible.builtin.command:
+        argv: "{{ day2_kubectl + ['get', 'nodes', '-o', 'wide'] }}"
+      register: day2_nodes_list
+      changed_when: false
+
+    - name: Report worker addition
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================================="
+          - "NEW WORKER JOINED THE CLUSTER THROUGH CLUSTER API"
+          - "=============================================================================="
+          - "Node name       : {{ day2_node_name }}"
+          - "IP address      : {{ worker_ip }}"
+          - "Inventory host  : {{ day2_worker_name }}"
+          - "Node pool       : {{ day2_md_namespace }}/{{ day2_md_name }}"
+          - "Rook operator   : {{ day2_rook_restart_outcome }}"
+          - "{{ day2_nodes_list.stdout_lines }}"
+          - "=============================================================================="

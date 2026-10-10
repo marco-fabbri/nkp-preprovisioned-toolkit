@@ -1,0 +1,231 @@
+---
+# ==============================================================================
+# Playbook: verify_hosts.yml - contract test of the hosts a provisioning module created
+# ==============================================================================
+# Usage (normally called by ./deploy.sh tofu-verify):
+#   ansible-playbook -i inventory.ini ansible/verify_hosts.yml -e preflight_skip_sizing=true
+#
+# Checks that the hosts created by tofu/<provider> are what the toolkit expects,
+# without installing NKP or anything else: the preflight checks on every host
+# (OS profile, cloud-init, addresses, VIP unassigned on a fresh cluster), then
+# the Ceph OSD disk and the local volume devices of the workers (each
+# configured value is resolved to a kernel name and reported as
+# "value -> /dev/<name> <size>"; a value that resolves to no disk, to the same
+# disk as another value or to the disk holding / fails), the kube-vip
+# interface of the control planes, cloud-init finished everywhere, and a
+# layer-2 test of the control plane VIP: the address is added for a few seconds
+# on the first control plane and pinged from a worker. Nothing persistent is
+# changed on the hosts.
+#
+# Extra vars:
+#   preflight_skip_sizing=true       skip the vCPU, RAM and disk size thresholds of the preflight
+#                                    (contract-test sized hosts: NKP must not be installed on them)
+#   contract_ceph_min_gib=1          smallest Ceph OSD disk accepted here, in GiB
+#   contract_local_volume_min_gib=1  smallest local volume device accepted here, in GiB
+# ==============================================================================
+
+# The NKP CLI bundle is not needed to verify hosts.
+- name: Preflight checks on every host
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    preflight_check_nkp_cli: false
+  roles:
+    - role: common
+    - role: preflight
+
+- name: Verify the disks, the interfaces and cloud-init
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    contract_ceph_min_gib: 1
+    contract_local_volume_min_gib: 1
+  roles:
+    - role: common
+  tasks:
+    # Each configured value (kernel name or absolute path) is resolved on the
+    # worker to the kernel name of its disk; the play stops when a value
+    # resolves to no disk, to the same disk as another value or to the disk
+    # holding / (role "common", tasks/data_disks.yml).
+    - name: Resolve the data disks of the worker
+      when: inventory_hostname in groups['workers']
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: data_disks
+
+    # One entry per expected disk: configured value, kernel name, use, minimum
+    # and size seen (GiB, from lsblk).
+    - name: Register the data disks expected on the worker
+      when: inventory_hostname in groups['workers']
+      ansible.builtin.set_fact:
+        verify_disks: >-
+          {{ (verify_disks if verify_disk_index > 0 else [])
+             + [item | combine({'min_gib': (contract_ceph_min_gib if item.kind == 'ceph' else contract_local_volume_min_gib) | int,
+                                'gib': (item.bytes | int / 1073741824) | round(0, 'floor') | int})] }}
+      loop: "{{ common_data_disks | default([]) }}"
+      loop_control:
+        index_var: verify_disk_index
+        label: "{{ item.value }} -> /dev/{{ item.name }}"
+
+    - name: Verify the data disks of the worker have at least the contract size
+      when: inventory_hostname in groups['workers']
+      ansible.builtin.assert:
+        that:
+          - item.gib | int >= item.min_gib | int
+        fail_msg: >-
+          {{ item.value }} (/dev/{{ item.name }}, {{ item.use }}) on worker {{ inventory_hostname }} is smaller than
+          {{ item.min_gib }} GiB ({{ item.gib }} GiB seen).
+        quiet: true
+      loop: "{{ verify_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.value }} -> /dev/{{ item.name }} ({{ item.use }}, {{ item.gib }} GiB)"
+
+    - name: Verify the kube-vip interface exists on the control plane
+      when: inventory_hostname in groups['control_plane']
+      ansible.builtin.assert:
+        that:
+          - virtual_ip_interface in ansible_facts['interfaces']
+        fail_msg: >-
+          Interface '{{ virtual_ip_interface }}' (virtual_ip_interface) does not exist on {{ inventory_hostname }}.
+          Detected interfaces: {{ ansible_facts['interfaces'] | join(', ') }}. The ansible_inventory output of the
+          provisioning module must name the NIC of its images.
+        quiet: true
+
+    # The preflight already waited for cloud-init; here its final status must be
+    # "done" (or "disabled" on an image without a datasource). A missing binary
+    # counts as not applicable.
+    - name: Read the cloud-init status
+      ansible.builtin.command:
+        argv: ['cloud-init', 'status']
+      register: verify_cloud_init
+      changed_when: false
+      failed_when: false
+
+    - name: Verify cloud-init finished
+      when: verify_cloud_init.rc != 2 or verify_cloud_init.stdout | default('') | length > 0
+      ansible.builtin.assert:
+        that:
+          - "verify_cloud_init.stdout | default('') is search('(?m)^status: (done|disabled)')"
+        fail_msg: >-
+          cloud-init on {{ inventory_hostname }} did not finish cleanly:
+          {{ verify_cloud_init.stdout | default('') | trim }} {{ verify_cloud_init.stderr | default('') | trim }}
+          (check 'cloud-init status --long' on the host).
+        quiet: true
+
+    - name: Record the results of this host for the summary
+      ansible.builtin.set_fact:
+        verify_host_report: >-
+          {{ (verify_disks | default([]) | map(attribute='value')
+              | zip(verify_disks | default([]) | map(attribute='name') | map('regex_replace', '^', '-> /dev/'),
+                    verify_disks | default([]) | map(attribute='gib') | map('string') | map('regex_replace', '$', ' GiB'))
+              | map('join', ' ') | list
+              + (['interface ' ~ virtual_ip_interface ~ ' present'] if inventory_hostname in groups['control_plane'] else [])
+              + ['cloud-init ' ~ (verify_cloud_init.stdout | default('') | regex_search('(?m)^status: .*') | default('not installed', true) | trim)]
+             ) | join(', ') }}
+
+# A cluster that already exists owns the VIP (kube-vip): the test is skipped.
+- name: Layer-2 test of the control plane VIP
+  hosts: control_plane[0]
+  become: true
+  gather_facts: false
+  vars:
+    verify_vip_worker: "{{ groups['workers'][0] }}"
+    verify_vip_cluster_exists: "{{ preflight_cluster_exists | default(false) | bool }}"
+  roles:
+    - role: common
+  tasks:
+    - name: Report that the VIP test is skipped on an existing cluster
+      when: verify_vip_cluster_exists
+      ansible.builtin.set_fact:
+        verify_vip_report: "skipped, cluster {{ cluster_name }} already exists and owns {{ control_plane_vip }}"
+
+    - name: Test that a worker reaches the VIP on {{ virtual_ip_interface }}
+      when: not verify_vip_cluster_exists
+      block:
+        - name: Add the VIP on {{ virtual_ip_interface }}
+          ansible.builtin.command:
+            argv: ['ip', 'addr', 'add', "{{ control_plane_vip }}/32", 'dev', "{{ virtual_ip_interface }}"]
+          register: verify_vip_add
+          changed_when: verify_vip_add.rc == 0
+          failed_when: false
+
+        - name: Ping the VIP from {{ verify_vip_worker }}
+          when: verify_vip_add.rc == 0
+          delegate_to: "{{ verify_vip_worker }}"
+          ansible.builtin.command:
+            argv: ['ping', '-c', '3', '-W', '2', "{{ control_plane_vip }}"]
+          register: verify_vip_ping
+          changed_when: false
+          failed_when: false
+      always:
+        - name: Remove the VIP from {{ virtual_ip_interface }}
+          when: verify_vip_add.rc | default(1) == 0
+          ansible.builtin.command:
+            argv: ['ip', 'addr', 'del', "{{ control_plane_vip }}/32", 'dev', "{{ virtual_ip_interface }}"]
+          changed_when: true
+
+    - name: Verify the VIP could be added on the interface
+      when: not verify_vip_cluster_exists
+      ansible.builtin.assert:
+        that:
+          - verify_vip_add.rc == 0
+        fail_msg: >-
+          Could not add {{ control_plane_vip }}/32 on {{ virtual_ip_interface }} of {{ inventory_hostname }}:
+          {{ verify_vip_add.stderr | default('') | trim }}. If the address is already configured on this host,
+          another cluster or service owns the VIP.
+        quiet: true
+
+    - name: Record the result of the VIP test
+      when: not verify_vip_cluster_exists
+      ansible.builtin.set_fact:
+        verify_vip_report: >-
+          {{ control_plane_vip }} on {{ virtual_ip_interface }} of {{ inventory_hostname }}
+          {{ 'answered' if verify_vip_ping.rc == 0 else 'did NOT answer' }} the ping from {{ verify_vip_worker }}
+
+    - name: Verify the worker reached the VIP over layer 2
+      when: not verify_vip_cluster_exists
+      ansible.builtin.assert:
+        that:
+          - verify_vip_ping.rc == 0
+        fail_msg: >-
+          {{ control_plane_vip }} was added on {{ virtual_ip_interface }} of {{ inventory_hostname }} but
+          {{ verify_vip_worker }} could not ping it ({{ verify_vip_ping.stdout_lines | default([]) | last | default('no output') }}).
+          kube-vip and MetalLB announce addresses the hypervisor did not assign to the VM, so the virtual switch
+          must let them through: on ESXi set "Forged transmits" and "MAC address changes" (and "Promiscuous mode"
+          for nested labs) to Accept on the port group; on Nutanix AHV and Proxmox disable IP and MAC filtering
+          (Flow microsegmentation, the Proxmox firewall) for these NICs. Also check that the control plane and
+          the workers share the same layer-2 segment and VLAN.
+        quiet: true
+
+- name: Report the outcome of the host verification
+  hosts: all
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Report the contract test outcome
+      run_once: true
+      vars:
+        verify_failed_hosts: "{{ ansible_play_hosts_all | difference(ansible_play_hosts) }}"
+        verify_first_cp: "{{ groups['control_plane'][0] }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['==============================================================================',
+              'HOST VERIFICATION ' ~ ('PASSED' if verify_failed_hosts | length == 0 else 'FAILED'),
+              '==============================================================================']
+             + (ansible_play_hosts_all
+                | zip(ansible_play_hosts_all | map('extract', hostvars)
+                      | map(attribute='verify_host_report', default='FAILED or unreachable, see the errors above') | list)
+                | map('join', ': ') | list)
+             + ['Control plane VIP: ' ~ (hostvars[verify_first_cp]['verify_vip_report'] | default('not tested, see the errors above'))]
+             + (['Hosts that failed: ' ~ (verify_failed_hosts | join(', '))] if verify_failed_hosts | length > 0 else [])
+             + ['=============================================================================='] }}
+
+    - name: Fail when a host did not pass the verification
+      run_once: true
+      when: ansible_play_hosts_all | difference(ansible_play_hosts) | length > 0
+      ansible.builtin.fail:
+        msg: >-
+          These hosts failed or were unreachable: {{ ansible_play_hosts_all | difference(ansible_play_hosts) | join(', ') }}.
+          Fix the provisioning module or the hosts (see the errors above) and run the verification again.
