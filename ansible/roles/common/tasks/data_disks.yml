@@ -1,0 +1,173 @@
+---
+# Resolve the worker data disks (ceph_osd_device, local_volume_devices) on one
+# host and check that they can be told apart. Included with
+#   ansible.builtin.include_role: {name: common, tasks_from: data_disks}
+# by preflight, node_prep, storage_network, remove_worker.yml and
+# verify_hosts.yml. Nothing else of role "common" runs tasks.
+#
+# Each configured value is either a kernel name (sdb, probed as /dev/sdb) or an
+# absolute path (/dev/disk/by-id/..., /dev/disk/by-path/..., /dev/sdb). Kernel
+# names follow the order in which the kernel detects the disks, not the
+# hypervisor slot, and can change at the next boot; the /dev/disk/by-* links
+# are maintained by udev from the disk identity and stay stable.
+#
+# Input (optional): common_data_disks_host, the host to probe. The probe is
+# delegated to it, so the file also works from the jump host play (Stage 4).
+# Default: the current host. The values themselves are read in the context of
+# the current host, like every other use of these variables.
+#
+# Output: fact common_data_disks, in configuration order (Ceph disk first, then
+# local volume 1..N), one dict per disk:
+#   value     configured value, as written in the inventory
+#   use       what the disk is for, for messages
+#   kind      'ceph' or 'volume'
+#   volume    volume number (1..N, position in local_volume_devices), 0 for Ceph
+#   path      path probed (/dev/<value> for a kernel name)
+#   resolved  what readlink -f returned for it
+#   name      kernel name it resolves to (sdc), used for lsblk and the facts
+#   type      lsblk TYPE (disk)
+#   bytes     size reported by lsblk
+# and fact common_data_disks_os, the kernel names of the disk(s) holding /.
+#
+# The probe is read-only (findmnt, lsblk, readlink -f). The file fails, naming
+# the host and the value, when a value is malformed, does not resolve to a
+# whole-disk block device, resolves to the same disk as another value or
+# resolves to the disk holding the root file system.
+
+- name: List the configured data disks, Ceph OSD disk first
+  ansible.builtin.set_fact:
+    common_data_disks_target: "{{ common_data_disks_host | default(inventory_hostname) }}"
+    common_data_disks_wanted: >-
+      {{ [{'value': ceph_osd_device, 'use': 'Ceph OSD disk (ceph_osd_device)', 'kind': 'ceph', 'volume': 0}]
+         if ceph_osd_device | length > 0 else [] }}
+    common_data_disks: []
+    common_data_disks_os: []
+
+- name: List the local volume devices in configuration order (volume N = N-th entry)
+  ansible.builtin.set_fact:
+    common_data_disks_wanted: >-
+      {{ common_data_disks_wanted
+         + [{'value': common_data_disks_value, 'kind': 'volume', 'volume': common_data_disks_index + 1,
+             'use': 'local volume ' ~ (common_data_disks_index + 1) ~ ' (local_volume_devices)'}] }}
+  loop: "{{ local_volume_devices }}"
+  loop_control:
+    loop_var: common_data_disks_value
+    index_var: common_data_disks_index
+
+# A kernel name has no slash; anything else must be an absolute path.
+- name: Verify the data disk values are kernel names or absolute paths
+  ansible.builtin.assert:
+    that:
+      - common_data_disks_value.value is string
+      - common_data_disks_value.value is match('^([a-z0-9]+|/\S+)$')
+    fail_msg: >-
+      {{ common_data_disks_value.use }} = '{{ common_data_disks_value.value }}' is neither a kernel device name
+      without /dev/ (for example sdb) nor an absolute path (for example /dev/disk/by-id/scsi-...).
+    quiet: true
+  loop: "{{ common_data_disks_wanted }}"
+  loop_control:
+    loop_var: common_data_disks_value
+    label: "{{ common_data_disks_value.value }}"
+
+# Output: one line per root disk ("os<TAB>sda"), then one line per value in
+# argument order ("dev<TAB>path<TAB>readlink -f result<TAB>lsblk TYPE SIZE",
+# the last field empty when the result is not a block device). The values are
+# passed as arguments of sh, never pasted into the script text.
+# lsblk --inverse walks from the source of / (partition, LVM volume, RAID
+# array) down to the disks underneath; findmnt --nofsroot drops the
+# [/subvolume] suffix btrfs adds to the source.
+- name: Resolve the data disks to kernel names on {{ common_data_disks_target }}
+  when: common_data_disks_wanted | length > 0
+  vars:
+    common_data_disks_probe_script: |
+      root_source=$(findmnt -n -v -o SOURCE /) || root_source=""
+      if [ -n "$root_source" ]; then
+        lsblk -n -r -s -o NAME,TYPE -- "$root_source" 2>/dev/null | while read -r name type; do
+          if [ "$type" = disk ]; then printf 'os\t%s\n' "$name"; fi
+        done
+      fi
+      for value in "$@"; do
+        resolved=$(readlink -f -- "$value" 2>/dev/null) || resolved=""
+        info=""
+        if [ -n "$resolved" ] && [ -b "$resolved" ]; then
+          info=$(lsblk -d -n -b -r -o TYPE,SIZE -- "$resolved" 2>/dev/null)
+        fi
+        printf 'dev\t%s\t%s\t%s\n' "$value" "$resolved" "$info"
+      done
+  delegate_to: "{{ common_data_disks_target }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['sh', '-c', common_data_disks_probe_script, 'data-disks']
+         + (common_data_disks_wanted | map(attribute='value') | map('regex_replace', '^(?=[^/])', '/dev/') | list) }}
+  register: common_data_disks_probe
+  changed_when: false
+
+- name: Record the disks holding the root file system of {{ common_data_disks_target }}
+  when: common_data_disks_wanted | length > 0
+  ansible.builtin.set_fact:
+    common_data_disks_os: "{{ common_data_disks_probe.stdout_lines | select('match', '^os\t') | map('regex_replace', '^os\t', '') | unique | list }}"
+
+# The padding guarantees four fields even when the last ones are empty.
+- name: Record the kernel name and size of each data disk
+  vars:
+    common_data_disks_fields: "{{ (common_data_disks_line ~ '\t\t\t').split('\t') }}"
+    common_data_disks_info: "{{ common_data_disks_fields[3].split() }}"
+  ansible.builtin.set_fact:
+    common_data_disks: >-
+      {{ common_data_disks
+         + [common_data_disks_wanted[common_data_disks_index]
+            | combine({'path': common_data_disks_fields[1],
+                       'resolved': common_data_disks_fields[2],
+                       'name': (common_data_disks_fields[2] | basename) if common_data_disks_info | length == 2 else '',
+                       'type': common_data_disks_info[0] | default(''),
+                       'bytes': common_data_disks_info[1] | default(0) | int})] }}
+  loop: "{{ common_data_disks_probe.stdout_lines | default([]) | select('match', '^dev\t') | list }}"
+  loop_control:
+    loop_var: common_data_disks_line
+    index_var: common_data_disks_index
+    label: "{{ common_data_disks_line.split('\t')[1] }}"
+
+- name: Verify every data disk value resolves to a whole disk on {{ common_data_disks_target }}
+  ansible.builtin.assert:
+    that:
+      - common_data_disks_value.name | length > 0
+      - common_data_disks_value.type == 'disk'
+    fail_msg: >-
+      {{ common_data_disks_value.use }} = '{{ common_data_disks_value.value }}' on {{ common_data_disks_target }}
+      {{ ('does not resolve to a block device (readlink -f ' ~ common_data_disks_value.path ~ ' gave '
+          ~ (common_data_disks_value.resolved or 'nothing') ~ ')')
+         if common_data_disks_value.name | length == 0
+         else ('resolves to ' ~ common_data_disks_value.resolved ~ ', a block device of type '
+               ~ common_data_disks_value.type ~ ', not a whole disk') }}.
+      Check the names on the host with: ls -l /dev/disk/by-id/; lsblk -o NAME,SIZE,SERIAL,TYPE
+    quiet: true
+  loop: "{{ common_data_disks }}"
+  loop_control:
+    loop_var: common_data_disks_value
+    label: "{{ common_data_disks_value.value }} -> {{ common_data_disks_value.resolved }}"
+
+- name: Verify the data disk values name distinct disks on {{ common_data_disks_target }}
+  ansible.builtin.assert:
+    that:
+      - common_data_disks | map(attribute='name') | unique | length == common_data_disks | length
+    fail_msg: >-
+      Two data disk values resolve to the same disk on {{ common_data_disks_target }}:
+      {{ common_data_disks | map(attribute='value')
+         | zip(common_data_disks | map(attribute='name') | map('regex_replace', '^', '/dev/'))
+         | map('join', ' -> ') | join(', ') }}.
+      ceph_osd_device and every entry of local_volume_devices must name a different disk.
+    quiet: true
+
+- name: Verify no data disk value names the disk holding / on {{ common_data_disks_target }}
+  ansible.builtin.assert:
+    that:
+      - common_data_disks_value.name not in common_data_disks_os
+    fail_msg: >-
+      {{ common_data_disks_value.use }} = '{{ common_data_disks_value.value }}' on {{ common_data_disks_target }}
+      resolves to /dev/{{ common_data_disks_value.name }}, the disk that holds the root file system
+      (operating system). Point it at a data disk: ls -l /dev/disk/by-id/; lsblk -o NAME,SIZE,SERIAL,MOUNTPOINT
+    quiet: true
+  loop: "{{ common_data_disks }}"
+  loop_control:
+    loop_var: common_data_disks_value
+    label: "{{ common_data_disks_value.value }} -> /dev/{{ common_data_disks_value.name }}"

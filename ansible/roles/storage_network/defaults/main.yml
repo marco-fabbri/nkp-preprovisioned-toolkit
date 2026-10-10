@@ -1,0 +1,21 @@
+---
+# ==============================================================================
+# Role Defaults: storage_network
+# ==============================================================================
+# The device Ceph uses on each worker is chosen with ceph_osd_device (role
+# "common"). The values below only apply to the loop device lab shortcut.
+
+# Sparse image file backing the loop device. The size is applied only when the
+# file is first created.
+storage_network_ceph_image_path: /var/lib/ceph-osd.img
+storage_network_ceph_image_size: 50G
+
+# Kernel name of the device checked on each worker, and the minimum size Rook
+# Ceph needs (40 GiB). Raw disk: the kernel name ceph_osd_device resolved to on
+# the worker being checked (common_data_disks, set by ceph_worker.yml through
+# role "common", tasks/data_disks.yml). Lab shortcut: the loop device.
+storage_network_ceph_device: >-
+  {{ (common_data_disks | default([]) | selectattr('kind', 'equalto', 'ceph') | map(attribute='name') | first | default(''))
+     if ceph_osd_device | length > 0 else storage_network_ceph_loop_name }}
+storage_network_ceph_loop_name: "{{ ceph_loop_device_name }}"
+storage_network_ceph_min_bytes: 42949672960

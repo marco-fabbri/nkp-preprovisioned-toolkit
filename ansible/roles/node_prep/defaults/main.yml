@@ -1,0 +1,9 @@
+---
+# ==============================================================================
+# Role Defaults: node_prep
+# ==============================================================================
+
+# Earlier revisions of this toolkit created an unused "konvoy" account with
+# passwordless sudo on every node. It is removed unless Cluster API is
+# configured to log in with that user.
+node_prep_remove_legacy_konvoy_user: true

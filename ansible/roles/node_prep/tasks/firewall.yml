@@ -1,0 +1,124 @@
+---
+# ==============================================================================
+# Role: node_prep - Host firewall rules for Kubernetes (firewalld / UFW)
+# ==============================================================================
+# The NKP guide requires firewalld disabled on the hosts, among the
+# prerequisites of pre-provisioned machines. This file never enables a firewall by itself and
+# never stops one: when a firewall is already active on a node it adds the rules
+# the cluster needs and prints a notice, because that setup is outside the
+# vendor prerequisites. It can be reused from other playbooks with include_role
+# (name: node_prep, tasks_from: firewall.yml).
+#
+# Trusted sources are the node subnet and the Pod CIDR. The Service CIDR is not
+# listed: ClusterIP addresses never appear as a packet source.
+
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Configure firewalld rules for Kubernetes (RedHat / Rocky)
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - (ansible_facts['services']['firewalld.service'] | default({})).get('state', '') == 'running'
+  block:
+    - name: Report that firewalld is active on a cluster node
+      ansible.builtin.debug:
+        msg: >-
+          NOTICE: firewalld is running on {{ inventory_hostname }}. The NKP guide requires firewalld
+          to be disabled on pre-provisioned machines (systemctl disable --now firewalld). It is left
+          running with the node subnet and the Pod CIDR as trusted sources: this setup is outside
+          the vendor prerequisites.
+
+    - name: Allow SSH service in firewalld
+      ansible.posix.firewalld:
+        service: ssh
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Allow the SSH port used by Ansible in firewalld
+      when: node_prep_ssh_port | int != 22
+      ansible.posix.firewalld:
+        port: "{{ node_prep_ssh_port }}/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Allow Kubernetes node subnet in firewalld trusted zone
+      ansible.posix.firewalld:
+        source: "{{ node_subnet_cidr }}"
+        zone: trusted
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Allow Kubernetes Pod CIDR in firewalld trusted zone
+      ansible.posix.firewalld:
+        source: "{{ pod_cidr }}"
+        zone: trusted
+        permanent: true
+        state: enabled
+        immediate: true
+
+    # Explicit state: node_firewalld_masquerade=false turns masquerading off
+    # on a node where an earlier run enabled it.
+    - name: Set masquerading in the default firewalld zone
+      ansible.posix.firewalld:
+        masquerade: true
+        permanent: true
+        state: "{{ 'enabled' if node_firewalld_masquerade | bool else 'disabled' }}"
+        immediate: true
+
+- name: Check whether UFW is installed (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: node_prep_ufw_binary
+
+# ufw.service is a oneshot unit that reports "active" even when the firewall is
+# disabled, so the real state is read from "ufw status".
+- name: Read UFW status (Debian / Ubuntu)
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - node_prep_ufw_binary.stat.exists
+  ansible.builtin.command:
+    cmd: ufw status
+  environment:
+    LC_ALL: C
+  register: node_prep_ufw_status
+  changed_when: false
+
+- name: Configure UFW rules for Kubernetes (Debian / Ubuntu)
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - node_prep_ufw_binary.stat.exists
+    - "'Status: active' in node_prep_ufw_status.stdout"
+  block:
+    - name: Report that UFW is active on a cluster node
+      ansible.builtin.debug:
+        msg: >-
+          NOTICE: UFW is active on {{ inventory_hostname }}. The NKP guide does not cover UFW; a host
+          firewall on a cluster node is outside the vendor prerequisites (ufw disable). It is left
+          active with the node subnet and the Pod CIDR as trusted sources.
+
+    # "ufw default allow routed" updates DEFAULT_FORWARD_POLICY and reloads
+    # the running ruleset, so the policy applies without a reboot.
+    - name: Set UFW default routed (forward) policy to allow for container routing
+      community.general.ufw:
+        direction: routed
+        default: allow
+
+    - name: Allow SSH port in UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ node_prep_ssh_port }}"
+        proto: tcp
+
+    - name: Allow Kubernetes node subnet in UFW
+      community.general.ufw:
+        rule: allow
+        from_ip: "{{ node_subnet_cidr }}"
+
+    - name: Allow Kubernetes Pod CIDR in UFW
+      community.general.ufw:
+        rule: allow
+        from_ip: "{{ pod_cidr }}"

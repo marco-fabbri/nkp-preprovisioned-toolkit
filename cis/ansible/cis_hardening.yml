@@ -1,0 +1,25 @@
+---
+# CIS Level 1 aligned baseline (subset of controls) for Rocky Linux 9 and
+# Ubuntu 24.04 LTS, adjusted for Kubernetes nodes. See cis/README.md.
+# Run through ./deploy.sh cis-harden (or ./cis/harden.sh), which sets
+# ANSIBLE_CONFIG so that role "common" is found.
+
+- name: Apply the CIS Level 1 aligned baseline (subset of controls)
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - role: common
+  handlers:
+    - name: Restart sshd daemon
+      ansible.builtin.service:
+        name: "{{ 'sshd' if ansible_facts['os_family'] == 'RedHat' else 'ssh' }}"
+        state: restarted
+
+    - name: Reload augenrules
+      ansible.builtin.command:
+        cmd: augenrules --load
+      changed_when: true
+  tasks:
+    - name: Run the baseline hardening tasks
+      ansible.builtin.include_tasks: tasks/hardening.yml

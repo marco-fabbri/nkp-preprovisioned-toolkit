@@ -1,0 +1,19 @@
+---
+# ==============================================================================
+# Role Defaults: kommander_deploy
+# ==============================================================================
+
+# The toolkit never applies or changes the NKP licence. The licence is bound to
+# the Cluster UUID (UID of the kube-system namespace), which exists only once
+# the cluster is created: the final summary prints it, and the licence is
+# activated in the NKP dashboard (Global > Settings > Licensing).
+
+# Installer configuration generated on the jump host ("nkp install kommander
+# --init" plus the Ceph host storage override). It is rewritten on every run:
+# hand edits are lost, and a changed file re-runs "nkp install kommander".
+kommander_deploy_installer_config: "{{ nkp_workdir }}/kommander.yaml"
+
+# Customisations of that file, merged last (dict, same layout as the file:
+# apps.<name>.enabled / values, ...). In inventory.ini write it as a JSON
+# object on one line; with -e use the JSON form.
+kommander_deploy_installer_overrides: {}

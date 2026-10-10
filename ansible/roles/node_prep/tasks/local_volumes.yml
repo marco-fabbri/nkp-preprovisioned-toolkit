@@ -1,0 +1,72 @@
+---
+# Local volumes for the local volume provisioner (variables in role "common").
+# Device mode: one volume per disk of local_volume_devices, mounted at
+# local_volume_mount_prefix<N>, on the workers only (the control plane nodes
+# have no data disks; they get the empty discovery directory). Directory mode
+# (empty list, lab shortcut): ten bind-mounted directories of the root file
+# system on every node, as in earlier revisions.
+
+# --- Lab shortcut: directories of the root file system ----------------------
+- name: Warn that the local volumes are directories of the root file system
+  run_once: true
+  when: local_volume_devices | length == 0
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: local_volume_devices is empty, so the local volumes are bind-mounted directories of the
+      root file system of each node (lab shortcut, vol1..vol10 under /var/local-disks). The NKP guide
+      expects dedicated disks of at least {{ local_volume_min_gib }} GiB per worker, mounted under
+      {{ local_volume_mount_prefix | dirname }}.
+
+- name: Create mount directories for localvolumeprovisioner (vol1-vol10)
+  when: local_volume_devices | length == 0
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop: "{{ [local_volume_mount_prefix, '/var/local-disks/vol'] | product(range(1, 11)) | map('join') | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Configure persistent bind mounts in /etc/fstab for localvolumeprovisioner
+  when: local_volume_devices | length == 0
+  ansible.posix.mount:
+    path: "{{ local_volume_mount_prefix }}{{ item }}"
+    src: "/var/local-disks/vol{{ item }}"
+    fstype: none
+    opts: bind
+    state: mounted
+  loop: "{{ range(1, 11) | list }}"
+  loop_control:
+    label: "{{ local_volume_mount_prefix }}{{ item }} (bind -> /var/local-disks/vol{{ item }})"
+
+# --- Guide layout: one disk per volume -----------------------------------------
+- name: Create the discovery directory of the local volume provisioner
+  when: local_volume_devices | length > 0
+  ansible.builtin.file:
+    path: "{{ local_volume_mount_prefix | dirname }}"
+    state: directory
+    mode: '0755'
+
+# Each value (kernel name or absolute path such as /dev/disk/by-id/...) is
+# resolved on the worker to the kernel name of its disk; the run stops when a
+# value resolves to no disk, to the same disk as another value (Ceph disk
+# included) or to the disk holding / (role "common", tasks/data_disks.yml).
+- name: Resolve the data disks of the worker
+  when:
+    - local_volume_devices | length > 0
+    - inventory_hostname in groups['workers']
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: data_disks
+
+# Volume N is the N-th entry of local_volume_devices, whatever kernel name its
+# disk received at this boot; the mount itself goes by file system UUID.
+- name: Set up the local volume device
+  when:
+    - local_volume_devices | length > 0
+    - inventory_hostname in groups['workers']
+  ansible.builtin.include_tasks: local_volume_device.yml
+  loop: "{{ common_data_disks | default([]) | selectattr('kind', 'equalto', 'volume') | list }}"
+  loop_control:
+    loop_var: node_prep_volume
+    label: "{{ node_prep_volume.value }} (/dev/{{ node_prep_volume.name }}) -> {{ local_volume_mount_prefix }}{{ node_prep_volume.volume }}"

@@ -1,0 +1,602 @@
+---
+# ==============================================================================
+# Role: preflight - Hardware, OS, Hash, and Network Requirements Verification
+# ==============================================================================
+
+- name: Validate inventory groups and required variables
+  run_once: true
+  ansible.builtin.assert:
+    that:
+      - groups['jump_host'] | default([]) | length == 1
+      - groups['control_plane'] | default([]) | length in [1, 3, 5]
+      - groups['workers'] | default([]) | length >= 1
+      - ansible_user is defined
+      - cluster_name is defined
+      - control_plane_vip is defined
+      - virtual_ip_interface is defined
+      - metallb_ip_range is defined
+      - pod_cidr is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
+      - service_cidr is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
+      - kubectl_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+    fail_msg: >-
+      Invalid inventory. Required: exactly 1 host in [jump_host], 1, 3 or 5 hosts
+      in [control_plane], at least 1 host in [workers]; variables ansible_user,
+      cluster_name, control_plane_vip, virtual_ip_interface and metallb_ip_range;
+      pod_cidr and service_cidr in CIDR notation; kubectl_version like v1.35.2.
+      See inventory.example.ini.
+    quiet: true
+
+- name: Verify the local NKP CLI bundle and the control machine state
+  delegate_to: localhost
+  run_once: true
+  become: false
+  block:
+    # The bundle is checked as downloaded: the SHA-256 the Support Portal
+    # publishes is the reference. Nutanix has republished a release under the
+    # same version with a rebuilt binary, so a checksum of the extracted binary
+    # would reject a legitimate bundle; the release itself is checked on the
+    # jump host with "nkp version".
+    - name: Verify the NKP CLI bundle
+      when: preflight_check_nkp_cli | bool
+      block:
+        - name: Refuse the variables of the extracted binary (replaced by the bundle)
+          ansible.builtin.assert:
+            that:
+              - nkp_binary_local_path is not defined
+              - nkp_binary_md5 is not defined
+              - nkp_binary_sha256 is not defined
+            fail_msg: >-
+              nkp_binary_local_path, nkp_binary_md5 and nkp_binary_sha256 are no longer used.
+              Place the NKP CLI bundle for Linux amd64 in downloads/ exactly as downloaded
+              from the Nutanix Support Portal and set nkp_version and nkp_archive_sha256
+              in the inventory (see downloads/README.md).
+            quiet: true
+
+        - name: Validate nkp_version and nkp_archive_sha256
+          ansible.builtin.assert:
+            that:
+              - nkp_version is defined
+              - nkp_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+              - nkp_archive_sha256 is defined
+              - nkp_archive_sha256 is match('^[0-9a-f]{64}$')
+            fail_msg: >-
+              nkp_version (like 2.18.0) and nkp_archive_sha256 (64 hexadecimal characters, the
+              SHA-256 the Nutanix Support Portal shows for the Linux amd64 bundle) are required
+              in the inventory. See downloads/README.md.
+            quiet: true
+
+        - name: Read the NKP CLI bundle
+          ansible.builtin.stat:
+            path: "{{ playbook_dir }}/../{{ nkp_archive_local_path }}"
+            checksum_algorithm: sha256
+            get_checksum: true
+            follow: true
+          register: preflight_nkp_archive
+
+        - name: Fail if the NKP CLI bundle is missing
+          ansible.builtin.fail:
+            msg: >-
+              NKP CLI bundle not found at '{{ nkp_archive_local_path }}'.
+              Download nkp_v{{ nkp_version }}_linux_amd64.tar.gz from the Nutanix Support Portal
+              into downloads/ (see downloads/README.md).
+          when: not preflight_nkp_archive.stat.exists
+
+        - name: Validate the SHA-256 of the NKP CLI bundle
+          ansible.builtin.assert:
+            that:
+              - preflight_nkp_archive.stat.checksum == nkp_archive_sha256
+            fail_msg: >-
+              SHA-256 mismatch for {{ nkp_archive_local_path }}: expected {{ nkp_archive_sha256 }},
+              got {{ preflight_nkp_archive.stat.checksum }}. Compare with the value the Nutanix
+              Support Portal shows for this file; the bundle may be corrupted, from another
+              release or platform, or republished (then update nkp_archive_sha256).
+            success_msg: "NKP CLI bundle SHA-256 verified: {{ preflight_nkp_archive.stat.checksum }}"
+
+        - name: List the NKP CLI bundle
+          ansible.builtin.command:
+            argv: ['tar', '-tzf', "{{ playbook_dir }}/../{{ nkp_archive_local_path }}"]
+          register: preflight_nkp_archive_list
+          changed_when: false
+
+        - name: Validate that the bundle contains the nkp executable
+          ansible.builtin.assert:
+            that:
+              - "'nkp' in preflight_nkp_archive_list.stdout_lines"
+            fail_msg: >-
+              {{ nkp_archive_local_path }} does not contain an 'nkp' file at its top level:
+              it is not the NKP CLI bundle for Linux amd64.
+            quiet: true
+
+    - name: Check for pre-existing cluster kubeconfig
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../{{ cluster_name }}.conf"
+      register: preflight_local_kubeconfig
+
+    - name: Explain how the NKP licence is handled
+      ansible.builtin.debug:
+        msg: >-
+          The cluster starts on the default key NKP assigns on non-Nutanix infrastructure
+          (tier Pro, not activated). The licence is bound to the Cluster UUID, which exists
+          only once the cluster is created: the final summary prints it, and you activate
+          your licence in the NKP dashboard (Global > Settings > Licensing).
+
+    # The password hash is computed on the control machine. Without a crypt
+    # implementation (macOS without passlib) the filter fails in the middle of
+    # Stage 1, so it is probed here with a throw-away value.
+    - name: Verify the control machine can hash vm_default_password
+      when: vm_default_password | default('') | length > 0
+      block:
+        - name: Probe the sha512 password hash filter
+          ansible.builtin.set_fact:
+            preflight_hash_probe: "{{ 'probe' | password_hash('sha512', 'preflightsalt000') | length > 0 }}"
+          no_log: true
+      rescue:
+        - name: Fail when the control machine cannot hash passwords
+          ansible.builtin.fail:
+            msg: >-
+              The control machine cannot compute sha512 password hashes. Install passlib in the
+              Python environment used by Ansible ({{ ansible_playbook_python }} -m pip install passlib),
+              or set vm_default_password to an empty string to leave passwords untouched.
+
+    # Pure-Python check on the control machine: no extra collection or
+    # library (ansible.utils / netaddr) is needed. Host names are skipped.
+    - name: Check host, VIP and MetalLB addresses against the Pod and Service CIDRs
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -c
+          - |
+            import ipaddress
+            import sys
+            nets = [ipaddress.ip_network(n, strict=False) for n in sys.argv[1].split(',')]
+            bad = []
+            for item in sys.argv[2].split(','):
+                try:
+                    addr = ipaddress.ip_address(item)
+                except ValueError:
+                    continue
+                if any(addr in net for net in nets):
+                    bad.append(item)
+            print(' '.join(bad))
+            sys.exit(1 if bad else 0)
+          - "{{ pod_cidr }},{{ service_cidr }}"
+          - "{{ preflight_checked_addresses | join(',') }}"
+      vars:
+        preflight_checked_addresses: >-
+          {{ (groups['all'] | map('extract', hostvars, 'ansible_host') | select('defined') | list)
+             + [control_plane_vip]
+             + (metallb_ip_range | split('-') | map('trim') | map('regex_replace', '/.*$', '') | list) }}
+      register: preflight_cidr_overlap
+      changed_when: false
+      failed_when: preflight_cidr_overlap.rc not in [0, 1]
+
+    - name: Assert no address falls inside the Pod or Service CIDR
+      ansible.builtin.assert:
+        that:
+          - preflight_cidr_overlap.rc == 0
+        fail_msg: >-
+          These addresses fall inside pod_cidr ({{ pod_cidr }}) or service_cidr ({{ service_cidr }}):
+          {{ preflight_cidr_overlap.stdout }}.
+          Node, VIP and MetalLB addresses must not overlap the Kubernetes Pod and Service networks.
+          Change the addresses, or set pod_cidr / service_cidr in inventory.ini before the cluster is created.
+        success_msg: "Host, VIP and MetalLB addresses do not overlap the Pod and Service CIDRs."
+
+# Cloud images often upgrade their packages on first boot. Until that ends the
+# package database is locked and package tasks fail (seen on Rocky: the import
+# of a repository GPG key). Hosts without cloud-init just skip the wait; a
+# cloud-init still running after the timeout (rc 124) stops the host below.
+- name: Wait for cloud-init to finish its first-boot work
+  ansible.builtin.command:
+    argv: ['timeout', "{{ preflight_cloud_init_timeout | int }}", 'cloud-init', 'status', '--wait']
+  become: true
+  register: preflight_cloud_init
+  changed_when: false
+  failed_when: false
+
+- name: Stop when cloud-init did not finish in time
+  ansible.builtin.assert:
+    that:
+      - preflight_cloud_init.rc != 124
+    fail_msg: >-
+      cloud-init on {{ inventory_hostname }} is still running after {{ preflight_cloud_init_timeout }} s
+      (check 'cloud-init status --long' on the host). Raise preflight_cloud_init_timeout or fix the host.
+    quiet: true
+
+- name: Validate os_profile configuration in inventory
+  ansible.builtin.assert:
+    that:
+      - os_profile is defined
+      - os_profile in ['rocky', 'ubuntu', 'rocky-cis', 'ubuntu-cis']
+    fail_msg: >-
+      Invalid or missing 'os_profile' in inventory.ini!
+      Configured: '{{ os_profile | default("UNDEFINED") }}'.
+      Supported choices are: 'rocky', 'ubuntu', 'rocky-cis', 'ubuntu-cis'.
+
+- name: Validate target node OS matches Rocky Linux profile
+  when: os_profile in ['rocky', 'rocky-cis']
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == 'Rocky'
+      - ansible_facts['distribution_major_version'] == '9'
+      - ansible_facts['architecture'] == 'x86_64'
+    fail_msg: >-
+      Host {{ inventory_hostname }} does not match chosen os_profile '{{ os_profile }}'!
+      Detected: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }} ({{ ansible_facts['architecture'] }}).
+      Required: Rocky Linux 9.x x86_64.
+    success_msg: >-
+      Host {{ inventory_hostname }} verified for profile {{ os_profile }}
+      ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }})
+
+- name: Validate target node OS matches Ubuntu profile
+  when: os_profile in ['ubuntu', 'ubuntu-cis']
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == 'Ubuntu'
+      - ansible_facts['distribution_version'] == '24.04'
+      - ansible_facts['architecture'] == 'x86_64'
+    fail_msg: >-
+      Host {{ inventory_hostname }} does not match chosen os_profile '{{ os_profile }}'!
+      Detected: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }} ({{ ansible_facts['architecture'] }}).
+      Required: Ubuntu 24.04 LTS x86_64.
+    success_msg: >-
+      Host {{ inventory_hostname }} verified for profile {{ os_profile }}
+      ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }})
+
+- name: Announce active OS profile and Hardening mode
+  run_once: true
+  ansible.builtin.debug:
+    msg:
+      - "------------------------------------------------------------------------------"
+      - "ACTIVE OS PROFILE : {{ os_profile }}"
+      - >-
+        HARDENING MODE    : {{ 'CIS Level 1 aligned baseline (subset of controls) with automated audit'
+        if os_profile is match('.*-cis$') else 'Standard Vanilla Baseline (CIS hardening skipped)' }}
+      - "------------------------------------------------------------------------------"
+
+- name: Warn when the inventory has fewer workers than the NKP guide lists
+  run_once: true
+  when: groups['workers'] | length < preflight_recommended_workers | int
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ groups['workers'] | length }} worker(s) in the inventory; the NKP guide lists
+      {{ preflight_recommended_workers }} for Pro and Ultimate clusters.
+
+- name: Warn that the size thresholds are skipped
+  run_once: true
+  when: preflight_skip_sizing | bool
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: preflight_skip_sizing=true, the vCPU, RAM and disk size thresholds are NOT checked.
+      Hosts that pass only this way are below the NKP requirements: do NOT install NKP on them.
+      This mode is meant for the contract test of a provisioning module (./deploy.sh tofu-verify).
+
+- name: Validate Jump Host sizing
+  when:
+    - inventory_hostname in groups['jump_host']
+    - not (preflight_skip_sizing | bool)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['processor_vcpus'] | int >= preflight_jump_host_min_vcpus | int
+      - ansible_facts['memtotal_mb'] | int >= preflight_jump_host_min_mem_mb | int
+    fail_msg: >-
+      Insufficient resources for Jump Host {{ inventory_hostname }}!
+      vCPU: {{ ansible_facts['processor_vcpus'] }} (min: {{ preflight_jump_host_min_vcpus }}),
+      RAM: {{ ansible_facts['memtotal_mb'] }} MB (min: {{ preflight_jump_host_min_mem_mb }} MB).
+
+- name: Validate Control Plane sizing
+  when:
+    - inventory_hostname in groups['control_plane']
+    - not (preflight_skip_sizing | bool)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['processor_vcpus'] | int >= preflight_control_plane_min_vcpus | int
+      - ansible_facts['memtotal_mb'] | int >= preflight_control_plane_min_mem_mb | int
+    fail_msg: >-
+      Insufficient resources for Control Plane {{ inventory_hostname }}!
+      vCPU: {{ ansible_facts['processor_vcpus'] }} (min: {{ preflight_control_plane_min_vcpus }}),
+      RAM: {{ ansible_facts['memtotal_mb'] }} MB (min: {{ preflight_control_plane_min_mem_mb }} MB).
+
+- name: Validate Worker sizing
+  when:
+    - inventory_hostname in groups['workers']
+    - not (preflight_skip_sizing | bool)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['processor_vcpus'] | int >= preflight_worker_min_vcpus | int
+      - ansible_facts['memtotal_mb'] | int >= preflight_worker_min_mem_mb | int
+    fail_msg: >-
+      Insufficient resources for Worker {{ inventory_hostname }}!
+      vCPU: {{ ansible_facts['processor_vcpus'] }} (min: {{ preflight_worker_min_vcpus }}),
+      RAM: {{ ansible_facts['memtotal_mb'] }} MB (min: {{ preflight_worker_min_mem_mb }} MB).
+
+# Lab shortcut only: the deepest mount point above /var/local-disks is the
+# filesystem that holds the local volumes (and the Ceph image in loop device mode).
+- name: Validate the Worker filesystem holding /var/local-disks can back the largest local volume claim
+  when:
+    - inventory_hostname in groups['workers']
+    - local_volume_devices | length == 0
+    - not (preflight_skip_sizing | bool)
+  vars:
+    preflight_local_fs_gib: >-
+      {{ ((ansible_facts['mounts'] | selectattr('mount', 'in', ['/', '/var', '/var/local-disks'])
+          | sort(attribute='mount') | map(attribute='size_total') | last | default(0))
+          / 1073741824) | round(0, 'floor') | int }}
+  ansible.builtin.assert:
+    that:
+      - preflight_local_fs_gib | int >= preflight_worker_min_root_fs_gib | int
+    fail_msg: >-
+      The filesystem holding /var/local-disks on Worker {{ inventory_hostname }} is {{ preflight_local_fs_gib }} GiB
+      (min: {{ preflight_worker_min_root_fs_gib }} GiB). The local volumes live on it and
+      Prometheus asks for a 100 GiB volume: give that filesystem at least 120 GB.
+
+# ------------------------------------------------------------------------------
+# Data disks of the workers (guide layout): the Ceph OSD disk and the local
+# volume devices. Each configured value (kernel name or absolute path) is first
+# resolved on the worker to the kernel name of the disk it designates (role
+# "common", tasks/data_disks.yml: stops on a value that resolves to no disk,
+# to the same disk as another value or to the disk holding /). The gathered
+# facts then give partitions and size of that kernel name; lsblk gives the
+# signatures. Everything is checked before the cluster is created; Stage 4
+# (ceph_worker) checks the Ceph disk again against the cluster state.
+# ------------------------------------------------------------------------------
+# Kernel names follow the detection order of the kernel, not the hypervisor
+# slot, and can change at the next boot. The values are checked here, before
+# anything is written to a disk, but the configuration stays fragile.
+- name: Warn when the data disks are configured by kernel name
+  run_once: true
+  when: preflight_kernel_name_disks | length > 0
+  vars:
+    preflight_kernel_name_disks: >-
+      {{ (([ceph_osd_device] if ceph_osd_device | length > 0 else []) + local_volume_devices)
+         | reject('match', '^/dev/disk/') | list }}
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: data disks configured by kernel name instead of a stable /dev/disk/by-* link
+      ({{ preflight_kernel_name_disks | join(', ') }}). Kernel names follow the order in which the kernel detects
+      the disks, not the hypervisor slot, and are not stable across boots: on a Proxmox worker the disk in slot
+      scsi2 came up as sdb and the one in scsi1 as sdc. The preflight resolves and checks the values on every
+      worker, but a later boot may swap them. Set ceph_osd_device and local_volume_devices to stable links,
+      for example /dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-ceph (list them on a worker with
+      ls -l /dev/disk/by-id/).
+
+- name: Resolve the data disks of the Worker
+  when: inventory_hostname in groups['workers']
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: data_disks
+
+# One entry per disk, in configuration order: the resolved disk (value, use,
+# kind, volume number, kernel name) plus minimum size, size seen (GiB, from the
+# facts of the kernel name: /sys/block/<disk>/size always counts 512-byte
+# sectors, whatever the logical sector size), accepted file systems and
+# accepted mount points. Volume N is the N-th entry of local_volume_devices,
+# whatever its kernel name. The first iteration starts a new list.
+- name: Register the data disks expected on the Worker
+  when: inventory_hostname in groups['workers']
+  vars:
+    preflight_disk_is_ceph: "{{ item.kind == 'ceph' }}"
+  ansible.builtin.set_fact:
+    preflight_data_disks: >-
+      {{ (preflight_data_disks if preflight_disk_index > 0 else [])
+         + [item | combine({'min_gib': (preflight_ceph_osd_min_gib if preflight_disk_is_ceph | bool else local_volume_min_gib) | int,
+                            'gib': (((ansible_facts['devices'][item.name] | default({})).sectors | default(0) | int)
+                                    * 512 / 1073741824) | round(0, 'floor') | int,
+                            'fstypes': ['ceph_bluestore'] if preflight_disk_is_ceph | bool else [local_volume_fstype],
+                            'mountpoints': [''] if preflight_disk_is_ceph | bool
+                                           else ['', local_volume_mount_prefix ~ item.volume]})] }}
+  loop: "{{ common_data_disks | default([]) }}"
+  loop_control:
+    index_var: preflight_disk_index
+    label: >-
+      {{ item.value }} (/dev/{{ item.name }}){{ (' -> ' ~ local_volume_mount_prefix ~ item.volume) if item.kind == 'volume' else '' }}
+
+- name: Validate the data disks of the Worker exist, are whole disks and are large enough
+  when: inventory_hostname in groups['workers']
+  ansible.builtin.assert:
+    that:
+      - item.name in ansible_facts['devices']
+      - ansible_facts['devices'][item.name].partitions | default({}) | length == 0
+      - (preflight_skip_sizing | bool) or (item.gib | int >= item.min_gib | int)
+    fail_msg: >-
+      {{ item.value }} (/dev/{{ item.name }}) on Worker {{ inventory_hostname }}, {{ item.use }}, is missing, has
+      partitions or is smaller than {{ item.min_gib }} GiB ({{ item.gib }} GiB seen). The guide layout needs a raw
+      disk for Ceph and one disk per local volume on every worker.
+      Block devices seen: {{ ansible_facts['devices'].keys() | list | join(', ') }}.
+    quiet: true
+  loop: "{{ preflight_data_disks | default([]) }}"
+  loop_control:
+    label: "{{ item.value }} (/dev/{{ item.name }}, {{ item.use }}, {{ item.gib }} GiB)"
+
+# The provisioner reports the file system size, a little below the disk size:
+# a disk of exactly local_volume_min_gib cannot satisfy a claim of that size.
+- name: Warn when a local volume device leaves no headroom above the largest claim
+  when:
+    - inventory_hostname in groups['workers']
+    - not (preflight_skip_sizing | bool)
+    - preflight_tight_disks | length > 0
+  vars:
+    preflight_tight_disks: >-
+      {{ preflight_data_disks | default([]) | selectattr('kind', 'equalto', 'volume')
+         | selectattr('gib', 'equalto', local_volume_min_gib | int) | map(attribute='name') | list }}
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: /dev/{{ preflight_tight_disks | join(', /dev/') }} on Worker {{ inventory_hostname }} measure exactly
+      {{ local_volume_min_gib }} GiB. The {{ local_volume_fstype }} file system on them is a little smaller, so a
+      claim of exactly {{ local_volume_min_gib }} GiB (Prometheus) cannot bind to these volumes. Give the local
+      volume disks some headroom, for example {{ local_volume_min_gib | int + 10 }} GiB.
+
+- name: Read the signatures of the data disks of the Worker
+  when: inventory_hostname in groups['workers']
+  ansible.builtin.command:
+    argv: ['lsblk', '-J', '-b', '-o', 'NAME,TYPE,FSTYPE,PTTYPE,MOUNTPOINT', "/dev/{{ item.name }}"]
+  loop: "{{ preflight_data_disks | default([]) }}"
+  loop_control:
+    label: "{{ item.value }} (/dev/{{ item.name }}, {{ item.use }})"
+  register: preflight_disk_lsblk
+  changed_when: false
+  failed_when: false
+
+# No partition table, no mount point other than the volume's own, and no file
+# system other than the one the toolkit (or Ceph) writes itself. A local volume
+# that a pod is using is also mounted by kubelet under /var/lib/kubelet/pods/,
+# and lsblk reports that mount point: it is the same disk doing its job on a
+# running cluster, not a foreign use.
+- name: Validate the data disks of the Worker carry no foreign signature and are not in use
+  when: inventory_hostname in groups['workers']
+  vars:
+    preflight_disk_info: "{{ ((item.stdout | default('') or '{}') | from_json).blockdevices | default([{}]) | first | default({}) }}"
+    preflight_disk_mountpoint: "{{ preflight_disk_info.mountpoint | default('', true) }}"
+    preflight_disk_mount_ok: >-
+      {{ preflight_disk_mountpoint in item.item.mountpoints
+         or (item.item.mountpoints | select | list | length > 0
+             and preflight_disk_mountpoint is match('^/var/lib/kubelet/pods/')) }}
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - preflight_disk_info.type | default('') == 'disk'
+      - preflight_disk_info.children | default([]) | length == 0
+      - preflight_disk_info.pttype | default('', true) | length == 0
+      - preflight_disk_info.fstype | default('', true) in ([''] + item.item.fstypes)
+      - preflight_disk_mount_ok | bool
+    fail_msg: >-
+      {{ item.item.value }} (/dev/{{ item.item.name }}) on Worker {{ inventory_hostname }}, {{ item.item.use }}, is in
+      use or carries a foreign signature: it must be a whole disk without partition table (wipefs --all or sgdisk
+      --zap-all clears it), with no file system other than {{ item.item.fstypes | join('/') }} and
+      {{ 'no mount point' if item.item.mountpoints | select | list | length == 0
+         else 'no mount point other than ' ~ (item.item.mountpoints | select | join(', '))
+              ~ ' (or a pod mount under /var/lib/kubelet/pods/ on a running cluster)' }}.
+      The toolkit never erases a foreign file system. lsblk reported:
+      {{ item.stdout | default('') }} {{ item.stderr | default('') }}
+    quiet: true
+  loop: "{{ preflight_disk_lsblk.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.value }} (/dev/{{ item.item.name }}, {{ item.item.use }})"
+
+- name: Validate the node subnet used by the host firewall rules
+  ansible.builtin.assert:
+    that:
+      - node_subnet_cidr is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
+    fail_msg: >-
+      Could not derive the node subnet of {{ inventory_hostname }} from its default route
+      (got '{{ node_subnet_cidr }}'). Set node_subnet_cidr in inventory.ini (for example 10.10.10.0/24).
+    quiet: true
+
+- name: Validate the kube-vip interface exists on Control Plane nodes
+  when: inventory_hostname in groups['control_plane']
+  ansible.builtin.assert:
+    that:
+      - virtual_ip_interface in ansible_facts['interfaces']
+    fail_msg: >-
+      Interface '{{ virtual_ip_interface }}' (virtual_ip_interface) does not exist on {{ inventory_hostname }}.
+      Detected interfaces: {{ ansible_facts['interfaces'] | join(', ') }}.
+      Check the name with 'ip -br a' on the control plane nodes.
+    success_msg: "Interface {{ virtual_ip_interface }} found on {{ inventory_hostname }}."
+
+# node_prep reads the public key on the jump host from this fact: role defaults
+# and inventory values that refer to other variables are not resolvable through
+# hostvars, a fact is.
+- name: Verify the cluster SSH key path on the Jump Host
+  when: inventory_hostname == groups['jump_host'][0]
+  ansible.builtin.assert:
+    that:
+      - cluster_ssh_key_path is string
+      - cluster_ssh_key_path is match('^/[^ ]+$')
+    fail_msg: >-
+      cluster_ssh_key_path must be an absolute path without spaces on the jump host
+      (got '{{ cluster_ssh_key_path }}'), for example /home/{{ ansible_user }}/.ssh/nkp_cluster_key.
+    quiet: true
+
+- name: Record the cluster SSH key path of the Jump Host
+  when: inventory_hostname == groups['jump_host'][0]
+  ansible.builtin.set_fact:
+    preflight_cluster_ssh_key_path: "{{ cluster_ssh_key_path }}"
+
+# A cluster counts as existing when a non-empty kubeconfig is on the control
+# machine or on the jump host. In that case the VIP answers and port 6443
+# listens by design.
+- name: Check for a cluster kubeconfig on the Jump Host
+  when: inventory_hostname == groups['jump_host'][0]
+  ansible.builtin.stat:
+    path: "{{ cluster_kubeconfig }}"
+  register: preflight_jump_kubeconfig
+
+- name: Determine whether the cluster already exists
+  ansible.builtin.set_fact:
+    preflight_cluster_exists: >-
+      {{ (preflight_assume_existing_cluster | bool)
+         or (preflight_local_kubeconfig.stat.exists and (preflight_local_kubeconfig.stat.size | default(0) | int > 0))
+         or ((hostvars[groups['jump_host'][0]]['preflight_jump_kubeconfig'] | default({})).get('stat', {}).get('size', 0) | int > 0) }}
+
+# The local copy is never removed by the toolkit: after rebuilding the hosts
+# with the same cluster_name, delete it to get these checks back.
+- name: Report that the fresh-cluster checks are skipped
+  when: preflight_cluster_exists | bool
+  run_once: true
+  ansible.builtin.debug:
+    msg: >-
+      Cluster '{{ cluster_name }}' is treated as EXISTING ({{
+        'preflight_assume_existing_cluster=true'
+        if preflight_assume_existing_cluster | bool
+        else ('kubeconfig ' ~ cluster_name ~ '.conf found in the repository root on the control machine'
+              if (preflight_local_kubeconfig.stat.exists and (preflight_local_kubeconfig.stat.size | default(0) | int > 0))
+              else 'kubeconfig found on the jump host')
+      }}): the "VIP unassigned" and "port 6443 free" checks are SKIPPED. If the hosts were rebuilt,
+      remove the stale kubeconfig ({{ cluster_name }}.conf in the repository root and on the jump host)
+      and run the check again.
+
+- name: Verify Control Plane VIP availability (fresh cluster only)
+  when: not (preflight_cluster_exists | bool)
+  delegate_to: "{{ groups['jump_host'][0] }}"
+  run_once: true
+  become: false
+  block:
+    # Probe only: rc 1 means no reply (VIP free), rc 0 means the VIP is taken.
+    # Any other outcome (ping missing or not permitted) is reported below.
+    - name: Ping the Control Plane VIP from the Jump Host
+      ansible.builtin.command:
+        argv:
+          - ping
+          - -c
+          - "2"
+          - -W
+          - "1"
+          - "{{ control_plane_vip }}"
+      register: preflight_vip_ping
+      changed_when: false
+      failed_when: false
+
+    # Evaluated only when ping really ran: any other return code means the
+    # check is inconclusive and is reported by the next task.
+    - name: Assert Control Plane VIP is unassigned
+      when: preflight_vip_ping.rc | default(-1) in [0, 1]
+      ansible.builtin.assert:
+        that:
+          - preflight_vip_ping.rc == 1
+        fail_msg: >-
+          Virtual IP {{ control_plane_vip }} responds to ping from the jump host!
+          The VIP must be an unassigned IP on the Layer 2 subnet so kube-vip can bind it.
+          If this cluster already exists and its kubeconfig was lost, re-run with
+          -e preflight_assume_existing_cluster=true.
+        success_msg: "Control Plane VIP {{ control_plane_vip }} does not answer on the Layer 2 subnet."
+
+    - name: Warn when the VIP check could not run
+      when: preflight_vip_ping.rc | default(-1) not in [0, 1]
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the VIP was NOT checked, ping could not be executed on the jump host
+          ({{ preflight_vip_ping.stderr | default('') | trim or preflight_vip_ping.msg | default('unknown error') }}).
+          The VIP availability check is inconclusive: verify manually that
+          {{ control_plane_vip }} is unassigned.
+
+- name: Verify API port 6443 is free (fresh cluster only)
+  when:
+    - inventory_hostname in groups['control_plane']
+    - not (preflight_cluster_exists | bool)
+  ansible.builtin.wait_for:
+    port: 6443
+    state: stopped
+    timeout: 2
+    msg: >-
+      Port 6443 is already listening on {{ inventory_hostname }}: the node carries a previous or
+      partially created cluster. Reset the node before creating a new cluster, or re-run with
+      -e preflight_assume_existing_cluster=true if this cluster already exists.

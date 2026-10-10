@@ -1,0 +1,183 @@
+---
+# ==============================================================================
+# Role: node_prep - OS Preparation, Kernel Modules, Sysctl, and CAPI Keys
+# ==============================================================================
+
+# The key is read from the jump host on every run, so this role also works
+# when the jump_host stage did not run in the same execution (--tags node_prep,
+# Day-2 playbooks).
+- name: Check for the Jump Host SSH public key
+  ansible.builtin.stat:
+    path: "{{ node_prep_jump_host_pubkey_path }}"
+  delegate_to: "{{ node_prep_jump_host }}"
+  run_once: true
+  register: node_prep_jump_pubkey_stat
+
+- name: Fail if the Jump Host SSH public key is missing
+  ansible.builtin.assert:
+    that:
+      - node_prep_jump_pubkey_stat.stat.exists
+    fail_msg: >-
+      SSH public key {{ node_prep_jump_host_pubkey_path }} not found on jump host
+      {{ node_prep_jump_host }}. Run the jump_host stage first
+      (./deploy.sh install --tags jump_host).
+    quiet: true
+  run_once: true
+
+- name: Read the Jump Host SSH public key
+  ansible.builtin.slurp:
+    src: "{{ node_prep_jump_host_pubkey_path }}"
+  delegate_to: "{{ node_prep_jump_host }}"
+  run_once: true
+  register: node_prep_jump_pubkey
+
+- name: Authorize the Jump Host SSH key for the cluster SSH user
+  ansible.posix.authorized_key:
+    user: "{{ cluster_ssh_user }}"
+    state: present
+    key: "{{ node_prep_jump_pubkey.content | b64decode | trim }}"
+
+# The salt is deterministic per host, so the hash (and the task) is stable
+# across runs. An empty vm_default_password leaves the password untouched.
+- name: Set the system password of the login user
+  when: vm_default_password | default('') | length > 0
+  ansible.builtin.user:
+    name: "{{ ansible_user }}"
+    password: "{{ vm_default_password | password_hash('sha512', vm_default_password_salt) }}"
+
+# sshd uses the first value it reads: the 01- prefix sorts before the drop-ins
+# written by cloud-init and by the OS installer.
+- name: Set PasswordAuthentication in OpenSSH on nodes
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/01-nkp-password-auth.conf
+    content: "PasswordAuthentication {{ 'yes' if ssh_password_authentication | bool else 'no' }}\n"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart sshd daemon
+
+- name: Remove the drop-in written by earlier revisions of this toolkit
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d/01-enable-password.conf
+    state: absent
+  notify: Restart sshd daemon
+
+- name: Remove the legacy konvoy service account
+  when:
+    - node_prep_remove_legacy_konvoy_user | bool
+    - cluster_ssh_user != 'konvoy'
+    - ansible_user != 'konvoy'
+  block:
+    - name: Remove the sudoers drop-in of user konvoy
+      ansible.builtin.file:
+        path: /etc/sudoers.d/konvoy
+        state: absent
+
+    # force + remove (userdel -f -r): the account goes even with an open
+    # session, together with its home and authorized_keys.
+    - name: Remove user konvoy
+      ansible.builtin.user:
+        name: konvoy
+        state: absent
+        force: true
+        remove: true
+
+- name: Disable Swap memory at runtime
+  when: ansible_facts['swaptotal_mb'] | default(0) | int > 0
+  ansible.builtin.command:
+    cmd: swapoff -a
+  changed_when: true
+
+- name: Permanently remove Swap from /etc/fstab
+  ansible.posix.mount:
+    name: "{{ item }}"
+    fstype: swap
+    state: absent
+  loop:
+    - swap
+    - none
+  loop_control:
+    label: "{{ item }}"
+
+- name: Configure the host firewall for Kubernetes
+  ansible.builtin.import_tasks: firewall.yml
+
+- name: Configure SELinux in Permissive mode (RedHat / Rocky)
+  when: ansible_facts['os_family'] == 'RedHat'
+  ansible.posix.selinux:
+    policy: targeted
+    state: permissive
+
+- name: Configure Kubernetes kernel modules
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+    mode: '0644'
+
+- name: Load runtime overlay kernel module
+  community.general.modprobe:
+    name: overlay
+    state: present
+
+- name: Load runtime br_netfilter kernel module
+  community.general.modprobe:
+    name: br_netfilter
+    state: present
+
+- name: Configure network sysctl settings for Kubernetes
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+  loop:
+    - key: net.bridge.bridge-nf-call-iptables
+      value: '1'
+    - key: net.bridge.bridge-nf-call-ip6tables
+      value: '1'
+    - key: net.ipv4.ip_forward
+      value: '1'
+    - key: net.ipv4.conf.all.rp_filter
+      value: '0'
+    - key: net.ipv4.conf.default.rp_filter
+      value: '0'
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+# xfsprogs provides mkfs.xfs for the local volume devices (local_volume_fstype).
+- name: Install support packages for Kubernetes and Storage (RedHat / Rocky)
+  when: ansible_facts['os_family'] == 'RedHat'
+  ansible.builtin.dnf:
+    name:
+      - socat
+      - conntrack-tools
+      - nfs-utils
+      - iscsi-initiator-utils
+      - iptables
+      - tar
+      - curl
+      - container-selinux
+      - xfsprogs
+    state: present
+
+- name: Install support packages for Kubernetes and Storage (Debian / Ubuntu)
+  when: ansible_facts['os_family'] == 'Debian'
+  ansible.builtin.apt:
+    name:
+      - socat
+      - conntrack
+      - nfs-common
+      - open-iscsi
+      - iptables
+      - tar
+      - curl
+      - xfsprogs
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Set up the local volumes for the local volume provisioner
+  ansible.builtin.import_tasks: local_volumes.yml
