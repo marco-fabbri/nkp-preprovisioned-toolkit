@@ -49,6 +49,7 @@ The validation status of the current revision is stated in
 | BL-17 | NKP installation on VMs created by `tofu/nutanix`, `tofu/esxi` and `tofu/vsphere` | Validated with `./deploy.sh tofu-verify` only |
 | BL-18 | Remove the directory shortcut data at `remove-worker` cleanup | With `local_volume_devices = []` the directories `/var/local-disks/volN` and their bind mounts are left on the host |
 | BL-20 | Upgrade to a later NKP release driven by the toolkit | An upgrade needs the CLI of the target release (set `nkp_version`: it is installed next to the current one), then `nkp upgrade kommander` and `nkp upgrade cluster` in the order of the guide; needs a lab with two releases |
+| BL-21 | Hypervisor-agnostic workload storage (opt-in) | A variable that makes an existing StorageClass (your CSI driver) the default after the installation; and, as the agnostic option, a second Rook Ceph cluster managed outside the NKP life cycle (BYOS, as the guide calls it) with the RBD CSI on the disks that today go to the local volume provisioner, or Longhorn. The Ceph that NKP installs cannot be used: the guide reserves it for the platform applications and Kommander deploys its operator with the CSI disabled |
 
 ## Out of scope
 

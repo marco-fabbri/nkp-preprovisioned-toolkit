@@ -23,8 +23,13 @@ AHV, VMware ESXi or vSphere**, with the disk layout NKP expects (see
 > the NKP CLI from the Nutanix Support Portal under your own entitlement, and you are
 > responsible for complying with the Nutanix licence terms.
 >
-> The toolkit is aimed at labs and proofs of concept and is provided "as is", without
-> warranty (see [License](#license)).
+> The toolkit installs the layout the NKP 2.18 guide prescribes for Pro and Ultimate
+> clusters on pre-provisioned infrastructure. It has been validated so far in a lab on
+> virtual machines (see
+> [Known limitations / validation status](#known-limitations--validation-status)); a
+> few defaults suit a lab and must be changed before production (see
+> [Security considerations](#security-considerations)). It is provided "as is",
+> without warranty (see [License](#license)).
 
 ## What it does
 
@@ -907,7 +912,10 @@ on a port other than 22, bare-metal hosts, and an NKP installation on VMs create
 
 Known limitations:
 
-- Lab and proof-of-concept oriented; not a hardened production reference.
+- Validated in a lab on virtual machines, not on bare metal or in production. The
+  lab defaults of [Security considerations](#security-considerations) (public
+  installation password, SSH password authentication, no SSH host key checking) must
+  be changed before production.
 - NKP 2.18.0, x86_64, Rocky Linux 9 and Ubuntu 24.04 LTS only. No air-gapped
   installation, no cluster upgrade automation.
 - One cluster per inventory. Control plane nodes cannot be added or removed.
@@ -916,10 +924,21 @@ Known limitations:
   worker root disks: adequate for a lab, not for data you care about. Ceph may report
   `HEALTH_WARN` for slow BlueStore operations on loop devices.
 - The default StorageClass `localvolumeprovisioner` hands out whole disks, one
-  PersistentVolume per local volume disk, with no resizing or snapshots. The NKP
-  guide states that this provisioner is not suitable for production: use a CSI
-  driver for your own storage instead.
-- The OpenTofu modules create VMs for a lab; `./deploy.sh tofu-verify` checks the
+  PersistentVolume per local volume disk, bound to its worker. In practice: a
+  PersistentVolumeClaim of any size takes a whole disk (four per worker by default,
+  some used by the platform applications), the pod using it can run only on that
+  worker, nothing is replicated, resized or snapshotted by the storage, and
+  `remove-worker` wipes the disks of that worker. Fast (local disks, no network),
+  but a worker failure takes its volumes with it and the number of volumes is fixed:
+  adequate for the platform applications and for workloads that replicate their own
+  data, not for stateful workloads that expect failover or growth from the storage.
+  The NKP guide states that this provisioner is not suitable for production. The
+  toolkit installs no CSI driver: after the installation add the one for your
+  platform (vSphere CSI, Nutanix CSI, a storage array driver) or a hypervisor-agnostic
+  one (a Rook Ceph cluster of your own, which the guide calls BYOS, or Longhorn) and
+  make it the default StorageClass. The Rook Ceph that NKP installs is not an option:
+  the guide reserves it for the platform applications and it runs without a CSI.
+- The OpenTofu modules create the hosts; `./deploy.sh tofu-verify` checks the
   contract (disks, interface, cloud-init, layer-2 VIP path), not the NKP sizing or
   the installation itself.
 - Day-2 scaling relies on Cluster API objects created by the NKP CLI (worker
