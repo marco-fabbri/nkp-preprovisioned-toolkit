@@ -626,6 +626,7 @@ Kubeconfig on the jump host: /home/nutanix/nkp/nkp-cluster.conf
 ------------------------------------------------------------------------------
 NKP LICENSE
 ------------------------------------------------------------------------------
+Cluster: nkp-cluster
 Cluster UUID (UID of the Cluster API cluster object): 0f2a6c1e-8d4b-4c3a-9b7e-5a1d2c3e4f50
 License status reported by the cluster: nutanix-license: tier=Pro valid=true licenseId= clusters=0 cores=0
 Until a licence is activated the cluster runs on the default key NKP assigns (tier Pro, no license id,
@@ -642,6 +643,7 @@ Once a licence is activated in the dashboard, running
 ```text
 NKP LICENSE
 ------------------------------------------------------------------------------
+Cluster: nkp-cluster
 Cluster UUID (UID of the Cluster API cluster object): 0f2a6c1e-8d4b-4c3a-9b7e-5a1d2c3e4f50
 License status reported by the cluster: nutanix-license: tier=Ultimate valid=true licenseId= clusters=0 cores=0
 An Ultimate licence is activated on this cluster
@@ -893,7 +895,7 @@ a failed task and the checks listed in the row held.
 
 | Scenario | Result |
 |---|---|
-| Fresh installation, 4 OS profiles, lab shortcuts (loop device for Ceph, bind-mounted directories for the local volumes), 2026-10-05/06 | Passed on `ubuntu` (62 min), `ubuntu-cis` (67 min), `rocky` (155 min), `rocky-cis` (164 min). All 38 Kommander HelmReleases Ready, Rook Ceph `HEALTH_OK` with four OSDs, no PersistentVolumeClaim pending, default `Pro` licence reported. Rocky takes longer because the NKP CLI provisions the control plane nodes one after the other, 20-30 minutes each |
+| Fresh installation, 4 OS profiles, lab shortcuts (loop device for Ceph, bind-mounted directories for the local volumes), 2026-10-05/06 | Passed on `ubuntu` (62 min), `ubuntu-cis` (67 min), `rocky` (155 min), `rocky-cis` (164 min). All 38 Kommander HelmReleases Ready, Rook Ceph `HEALTH_OK` with four OSDs, no PersistentVolumeClaim pending, default `Pro` licence reported. The gap is in the control plane: Cluster API provisions its three nodes one after the other on both distributions, 5-7 minutes each on Ubuntu (measured 2026-10-08) and 20-30 on Rocky; same hypervisor and VM sizing, the difference is inside the guest, in the package installation step, and has not been profiled on Rocky |
 | CIS audit after a `-cis` installation | 65 PASS, 0 FAIL on both `ubuntu-cis` and `rocky-cis` |
 | Day-2 cycle (`remove-worker` then `add-worker` of the same host), 4 OS profiles | Passed on every profile. The rejoined worker was Ready, held a new OSD and Ceph was back to `HEALTH_OK` |
 | Fresh installation with the guide disk layout (raw Ceph disk, one disk per local volume), VMs created by `tofu/proxmox` with `sizing_profile = pro-ultimate`, `ubuntu-cis`, 2026-10-07 | Passed in 53 min. CIS audit 65 PASS, 0 FAIL; all 34 HelmReleases Ready; Ceph `HEALTH_OK` with one OSD per worker on its `nkp-ceph` disk; every PersistentVolumeClaim bound to a local volume disk (Prometheus: 100 GiB on `/mnt/disks/vol3`) |

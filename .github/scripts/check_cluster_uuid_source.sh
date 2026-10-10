@@ -10,5 +10,9 @@ grep -q 'clusters.cluster.x-k8s.io' "$task" || { echo "FAIL: $task must read the
 if grep -n -E 'namespace[[:space:]]*$|^[[:space:]]*- kube-system[[:space:]]*$' "$task" | grep -q .; then
   echo "FAIL: $task still reads a namespace UID for the Cluster UUID"; exit 1
 fi
+defaults=ansible/roles/kommander_deploy/defaults/main.yml
+if grep -n -i 'kube-system' "$defaults" | grep -q .; then
+  echo "FAIL: $defaults still describes the Cluster UUID as a namespace UID"; exit 1
+fi
 grep -q "get cluster -o jsonpath='{.items\[0\].metadata.uid}'" README.md || { echo "FAIL: README.md must show the Cluster API command for the Cluster UUID"; exit 1; }
 echo "cluster uuid source: Cluster API cluster object (task and README agree)"

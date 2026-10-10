@@ -4,9 +4,10 @@
 # ==============================================================================
 
 # The toolkit never applies or changes the NKP licence. The licence is bound to
-# the Cluster UUID (UID of the kube-system namespace), which exists only once
-# the cluster is created: the final summary prints it, and the licence is
-# activated in the NKP dashboard (Global > Settings > Licensing).
+# the Cluster UUID (UID of the Cluster API cluster object, not of a namespace),
+# which exists only once the cluster is created: the final summary prints it
+# with the cluster name, and the licence is activated in the NKP dashboard
+# (Global > Settings > Licensing).
 
 # Installer configuration generated on the jump host ("nkp install kommander
 # --init" plus the Ceph host storage override). It is rewritten on every run:

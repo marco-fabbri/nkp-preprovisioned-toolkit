@@ -322,6 +322,7 @@
     banner_license_activated_lines:
       - "NKP LICENSE"
       - "{{ banner_sep }}"
+      - "Cluster: {{ cluster_name }}"
       - "Cluster UUID (UID of the Cluster API cluster object): {{ banner_cluster_uuid }}"
       - "License status reported by the cluster: {{ banner_license_status }}"
       - "{{ 'An' if banner_license_tier is match('^[AEIOUaeiou]') else 'A' }} {{ banner_license_tier }} licence is activated on this cluster"
@@ -331,6 +332,7 @@
     banner_license_default_lines:
       - "NKP LICENSE"
       - "{{ banner_sep }}"
+      - "Cluster: {{ cluster_name }}"
       - "Cluster UUID (UID of the Cluster API cluster object): {{ banner_cluster_uuid }}"
       - "License status reported by the cluster: {{ banner_license_status }}"
       - "Until a licence is activated the cluster runs on the default key NKP assigns (tier Pro, no license id,"
