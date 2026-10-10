@@ -13,6 +13,7 @@
       - git
       - iptables
       - iputils
+      - bash-completion
     state: present
 
 - name: Install base system dependencies (Debian / Ubuntu)
@@ -25,6 +26,7 @@
       - git
       - iptables
       - iputils-ping
+      - bash-completion
     state: present
     update_cache: true
     cache_valid_time: 3600
@@ -150,18 +152,71 @@
     mode: '0755'
     force: true
 
-- name: Deploy official NKP CLI binary to Jump Host
-  ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../{{ nkp_binary_local_path }}"
-    dest: /usr/local/bin/nkp
+# One directory per NKP release and /usr/local/bin/nkp pointing at the release
+# in use: a later release is installed next to the current one (an upgrade
+# needs the CLI of the target release) and the previous one stays for
+# diagnosis. "creates" keeps the bundle from being copied again on every run.
+- name: Create the NKP CLI directory for release {{ nkp_version }}
+  ansible.builtin.file:
+    path: "{{ nkp_cli_install_dir }}/{{ nkp_version }}"
+    state: directory
     owner: root
     group: root
     mode: '0755'
 
-- name: Verify the NKP CLI runs on the Jump Host
+- name: Install the NKP CLI from the bundle
+  ansible.builtin.unarchive:
+    src: "{{ playbook_dir }}/../{{ nkp_archive_local_path }}"
+    dest: "{{ nkp_cli_install_dir }}/{{ nkp_version }}"
+    include:
+      - nkp
+    creates: "{{ nkp_cli_install_dir }}/{{ nkp_version }}/nkp"
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Point /usr/local/bin/nkp at release {{ nkp_version }}
+  ansible.builtin.file:
+    src: "{{ nkp_cli_install_dir }}/{{ nkp_version }}/nkp"
+    dest: /usr/local/bin/nkp
+    state: link
+    force: true
+
+- name: Read the NKP CLI version on the Jump Host
   ansible.builtin.command:
     cmd: /usr/local/bin/nkp version
+  register: jump_host_nkp_version
   changed_when: false
+
+- name: Verify the NKP CLI is release {{ nkp_version }}
+  ansible.builtin.assert:
+    that:
+      - "'nkp: v' ~ nkp_version in jump_host_nkp_version.stdout_lines"
+    fail_msg: >-
+      /usr/local/bin/nkp reports {{ jump_host_nkp_version.stdout_lines | join(', ') }},
+      not nkp: v{{ nkp_version }}: the bundle in {{ nkp_archive_local_path }} is not release
+      {{ nkp_version }}.
+    quiet: true
+
+# Both CLIs generate their own bash completion; bash-completion (installed
+# above) loads every file in /etc/bash_completion.d/ for interactive shells.
+- name: Generate the bash completion of the nkp and kubectl CLIs
+  ansible.builtin.command:
+    argv: ["/usr/local/bin/{{ item }}", "completion", "bash"]
+  loop: [nkp, kubectl]
+  register: jump_host_completion
+  changed_when: false
+
+- name: Install the bash completion of the nkp and kubectl CLIs
+  ansible.builtin.copy:
+    content: "{{ item.stdout }}\n"
+    dest: "/etc/bash_completion.d/{{ item.item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ jump_host_completion.results }}"
+  loop_control:
+    label: "{{ item.item }}"
 
 - name: Create the SSH directory for the cluster keypair
   ansible.builtin.file:

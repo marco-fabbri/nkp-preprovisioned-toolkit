@@ -97,6 +97,14 @@ preflight_skip_sizing: false
 # Home and working directory of ansible_user on the jump host.
 nkp_user_home: "/home/{{ ansible_user }}"
 nkp_workdir: "{{ nkp_user_home }}/nkp"
+# NKP CLI release (nkp_version, set in the inventory). The CLI bundle for Linux
+# amd64 is read as downloaded from the Nutanix Support Portal and verified
+# against the SHA-256 the portal publishes (nkp_archive_sha256, inventory). On
+# the jump host each release is installed under its own directory and
+# /usr/local/bin/nkp points at the release in use, so a later release (an
+# upgrade needs the CLI of the target release) sits next to the current one.
+nkp_archive_local_path: "downloads/nkp_v{{ nkp_version }}_linux_amd64.tar.gz"
+nkp_cli_install_dir: /usr/local/lib/nkp
 cluster_kubeconfig: "{{ nkp_workdir }}/{{ cluster_name }}.conf"
 
 # SSH identity used by Cluster API (from the jump host) to reach the nodes.

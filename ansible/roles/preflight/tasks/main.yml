@@ -26,53 +26,86 @@
       See inventory.example.ini.
     quiet: true
 
-- name: Verify local NKP CLI binary integrity
+- name: Verify the local NKP CLI bundle and the control machine state
   delegate_to: localhost
   run_once: true
   become: false
   block:
-    - name: Verify the NKP CLI binary
-      when: preflight_check_nkp_binary | bool
+    # The bundle is checked as downloaded: the SHA-256 the Support Portal
+    # publishes is the reference. Nutanix has republished a release under the
+    # same version with a rebuilt binary, so a checksum of the extracted binary
+    # would reject a legitimate bundle; the release itself is checked on the
+    # jump host with "nkp version".
+    - name: Verify the NKP CLI bundle
+      when: preflight_check_nkp_cli | bool
       block:
-        - name: Check if NKP CLI binary exists
+        - name: Refuse the variables of the extracted binary (replaced by the bundle)
+          ansible.builtin.assert:
+            that:
+              - nkp_binary_local_path is not defined
+              - nkp_binary_md5 is not defined
+              - nkp_binary_sha256 is not defined
+            fail_msg: >-
+              nkp_binary_local_path, nkp_binary_md5 and nkp_binary_sha256 are no longer used.
+              Place the NKP CLI bundle for Linux amd64 in downloads/ exactly as downloaded
+              from the Nutanix Support Portal and set nkp_version and nkp_archive_sha256
+              in the inventory (see downloads/README.md).
+            quiet: true
+
+        - name: Validate nkp_version and nkp_archive_sha256
+          ansible.builtin.assert:
+            that:
+              - nkp_version is defined
+              - nkp_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+              - nkp_archive_sha256 is defined
+              - nkp_archive_sha256 is match('^[0-9a-f]{64}$')
+            fail_msg: >-
+              nkp_version (like 2.18.0) and nkp_archive_sha256 (64 hexadecimal characters, the
+              SHA-256 the Nutanix Support Portal shows for the Linux amd64 bundle) are required
+              in the inventory. See downloads/README.md.
+            quiet: true
+
+        - name: Read the NKP CLI bundle
           ansible.builtin.stat:
-            path: "{{ playbook_dir }}/../{{ nkp_binary_local_path }}"
+            path: "{{ playbook_dir }}/../{{ nkp_archive_local_path }}"
             checksum_algorithm: sha256
             get_checksum: true
             follow: true
-          register: preflight_nkp_stat
+          register: preflight_nkp_archive
 
-        - name: Fail if NKP binary is missing
+        - name: Fail if the NKP CLI bundle is missing
           ansible.builtin.fail:
             msg: >-
-              NKP binary not found at '{{ nkp_binary_local_path }}'.
-              See downloads/README.md for download instructions from the Nutanix support portal.
-          when: not preflight_nkp_stat.stat.exists
+              NKP CLI bundle not found at '{{ nkp_archive_local_path }}'.
+              Download nkp_v{{ nkp_version }}_linux_amd64.tar.gz from the Nutanix Support Portal
+              into downloads/ (see downloads/README.md).
+          when: not preflight_nkp_archive.stat.exists
 
-        - name: Calculate MD5 checksum of NKP binary
-          ansible.builtin.stat:
-            path: "{{ playbook_dir }}/../{{ nkp_binary_local_path }}"
-            checksum_algorithm: md5
-            get_checksum: true
-            follow: true
-          register: preflight_nkp_stat_md5
-
-        - name: Validate MD5 checksum of NKP binary
+        - name: Validate the SHA-256 of the NKP CLI bundle
           ansible.builtin.assert:
             that:
-              - preflight_nkp_stat_md5.stat.checksum == nkp_binary_md5
+              - preflight_nkp_archive.stat.checksum == nkp_archive_sha256
             fail_msg: >-
-              MD5 checksum mismatch! Expected: {{ nkp_binary_md5 }}, Got: {{ preflight_nkp_stat_md5.stat.checksum }}.
-              The binary may be corrupted or from a different release version.
-            success_msg: "NKP binary MD5 checksum verified successfully: {{ preflight_nkp_stat_md5.stat.checksum }}"
+              SHA-256 mismatch for {{ nkp_archive_local_path }}: expected {{ nkp_archive_sha256 }},
+              got {{ preflight_nkp_archive.stat.checksum }}. Compare with the value the Nutanix
+              Support Portal shows for this file; the bundle may be corrupted, from another
+              release or platform, or republished (then update nkp_archive_sha256).
+            success_msg: "NKP CLI bundle SHA-256 verified: {{ preflight_nkp_archive.stat.checksum }}"
 
-        - name: Validate SHA-256 checksum of NKP binary
+        - name: List the NKP CLI bundle
+          ansible.builtin.command:
+            argv: ['tar', '-tzf', "{{ playbook_dir }}/../{{ nkp_archive_local_path }}"]
+          register: preflight_nkp_archive_list
+          changed_when: false
+
+        - name: Validate that the bundle contains the nkp executable
           ansible.builtin.assert:
             that:
-              - preflight_nkp_stat.stat.checksum == nkp_binary_sha256
+              - "'nkp' in preflight_nkp_archive_list.stdout_lines"
             fail_msg: >-
-              SHA-256 checksum mismatch! Expected: {{ nkp_binary_sha256 }}, Got: {{ preflight_nkp_stat.stat.checksum }}.
-            success_msg: "NKP binary SHA-256 checksum verified successfully: {{ preflight_nkp_stat.stat.checksum }}"
+              {{ nkp_archive_local_path }} does not contain an 'nkp' file at its top level:
+              it is not the NKP CLI bundle for Linux amd64.
+            quiet: true
 
     - name: Check for pre-existing cluster kubeconfig
       ansible.builtin.stat:

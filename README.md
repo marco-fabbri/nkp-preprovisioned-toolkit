@@ -32,8 +32,8 @@ AHV, VMware ESXi or vSphere**, with the disk layout NKP expects (see
 
 | Stage | Tag | Hosts | What happens |
 |---|---|---|---|
-| 0 | `preflight` (always runs) | all | Inventory, NKP CLI checksums, OS, sizing, worker data disks (Ceph and local volume disks: present, raw, large enough), address overlap, VIP and port 6443 checks |
-| 1 | `jump_host` | jump host | Docker CE, `kubectl`, the NKP CLI, SSH key pair used by Cluster API |
+| 0 | `preflight` (always runs) | all | Inventory, NKP CLI bundle checksum, OS, sizing, worker data disks (Ceph and local volume disks: present, raw, large enough), address overlap, VIP and port 6443 checks |
+| 1 | `jump_host` | jump host | Docker CE, `kubectl`, the NKP CLI (both with bash completion), SSH key pair used by Cluster API |
 | 2 | `node_prep` | cluster nodes | SSH key, swap off, kernel modules, sysctl, packages, local volume disks formatted and mounted under `/mnt/disks/` on the workers, firewall rules only if a firewall is already active, SELinux permissive on Rocky |
 | 2.5 | `cis` | all | Only with a `-cis` profile: apply and audit the [CIS Level 1 aligned baseline](#cis-level-1-aligned-baseline) |
 | 3 | `cluster_deploy` | jump host | `nkp create cluster preprovisioned --self-managed` with kube-vip; kubeconfig fetched to the repository root |
@@ -57,7 +57,7 @@ flowchart TD
     subgraph Controller [Control machine]
         CLI["./deploy.sh"]
         Inv["inventory.ini"]
-        Bin["downloads/nkp"]
+        Bin["downloads/nkp_v2.18.0_linux_amd64.tar.gz"]
         Tofu["tofu/&lt;provider&gt; (optional)"]
     end
 
@@ -252,14 +252,19 @@ traffic of the CNI and of kube-proxy).
 
 ### NKP CLI
 
-Download the NKP v2.18.0 CLI for **Linux amd64** from the Nutanix Support Portal and
-save the executable as `downloads/nkp` (details in
-[downloads/README.md](downloads/README.md)). Preflight verifies its MD5 and SHA-256
-against `nkp_binary_md5` and `nkp_binary_sha256` in the inventory.
+Download the NKP v2.18.0 CLI bundle for **Linux amd64**
+(`nkp_v2.18.0_linux_amd64.tar.gz`) from the Nutanix Support Portal and place it in
+`downloads/` as it is, without extracting it (details in
+[downloads/README.md](downloads/README.md)). Set `nkp_version` and
+`nkp_archive_sha256` in the inventory: the preflight verifies the bundle against that
+SHA-256, the one the portal shows next to the download, and refuses a file that is
+not the Linux amd64 bundle. The jump host stage installs the CLI from the bundle,
+one directory per release under `/usr/local/lib/nkp/` with `/usr/local/bin/nkp`
+pointing at `nkp_version`, and checks that `nkp version` reports that release.
 
-The checksums in `inventory.example.ini` were computed by the author on the v2.18.0
-linux/amd64 CLI. The authoritative values are those published by Nutanix; update the
-two variables for any other build.
+The bundle is verified rather than the extracted executable because the portal
+publishes the checksum of the bundle, and because Nutanix has republished a release
+under the same version with a rebuilt executable.
 
 ## Provisioning the hosts with OpenTofu (optional)
 
@@ -484,8 +489,8 @@ Preflight checks that every host really runs the declared distribution.
 | `control_plane_vip` | `10.10.10.85` | kube-vip address of the Kubernetes API |
 | `virtual_ip_interface` | `eth0` | Interface on the control plane nodes that carries the VIP |
 | `metallb_ip_range` | `10.10.10.90-10.10.10.99` | MetalLB Layer 2 pool |
-| `nkp_binary_local_path` | `downloads/nkp` | NKP CLI, relative to the repository root |
-| `nkp_binary_md5`, `nkp_binary_sha256` | see example | Expected checksums of the NKP CLI |
+| `nkp_version` | `2.18.0` | NKP release of the CLI bundle; the jump host must report it in `nkp version` |
+| `nkp_archive_sha256` | see example | SHA-256 of the CLI bundle as published by the Nutanix Support Portal |
 
 ### Optional variables
 
@@ -512,7 +517,8 @@ Preflight checks that every host really runs the declared distribution.
 | `preflight_jump_host_min_vcpus`, `preflight_jump_host_min_mem_mb` | `4`, `7500` | Size thresholds of the jump host |
 | `preflight_recommended_workers` | `4` | Workers listed by the guide; fewer only produce a warning |
 | `preflight_skip_sizing` | `false` | `true` skips the vCPU, RAM and disk size thresholds of the preflight (every other check still runs) and prints a warning that NKP must not be installed on such hosts. Set by `./deploy.sh tofu-verify` |
-| `preflight_check_nkp_binary` | `true` | `false` skips the existence and checksum checks of the NKP CLI (`ansible/verify_hosts.yml` sets it) |
+| `nkp_archive_local_path` | `downloads/nkp_v<nkp_version>_linux_amd64.tar.gz` | NKP CLI bundle, relative to the repository root |
+| `preflight_check_nkp_cli` | `true` | `false` skips the existence, checksum and content checks of the NKP CLI bundle (`ansible/verify_hosts.yml` sets it) |
 | `preflight_cloud_init_timeout` | `1200` | Seconds to wait for cloud-init to finish its first boot on each host |
 | `ceph_osd_device` | `sdb` | Raw disk each worker gives to Rook Ceph: kernel name without `/dev/` or absolute path, `/dev/disk/by-id/...` recommended (kernel names can change at boot, the preflight warns); `""` = loop device lab shortcut, see [Worker disks](#worker-disks) |
 | `local_volume_devices` | `["sdc", "sdd", "sde", "sdf"]` | Disks each worker gives to the local volume provisioner, same forms as `ceph_osd_device`, volume N = N-th entry; `[]` = directory lab shortcut (vol1..vol10 bind-mounted on every node) |
@@ -725,7 +731,7 @@ passed to `ansible-playbook`.
 
 1. Validates the address: IPv4, not the VIP, not an existing inventory host, outside
    `metallb_ip_range`.
-2. Runs the preflight role on the jump host and the new host (so `downloads/nkp`
+2. Runs the preflight role on the jump host and the new host (so the NKP CLI bundle
    must still be present, and the new host needs the same data disks as the other
    workers), then the same OS preparation as the original workers, including the
    local volume disks. On a `-cis` profile the baseline is applied too; run
@@ -938,7 +944,7 @@ cis/                      CIS Level 1 aligned baseline (playbooks, wrappers, REA
 scripts/                  add-node.sh, remove-node.sh (called by deploy.sh)
 tofu/                     optional OpenTofu provisioning modules (README, modules/layout,
                           proxmox, nutanix, esxi, vsphere, scripts)
-downloads/                place the NKP CLI here (not committed)
+downloads/                place the NKP CLI bundle here (not committed)
 kb/                       optional local vendor documentation (not committed)
 ```
 

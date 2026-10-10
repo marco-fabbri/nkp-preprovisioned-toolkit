@@ -29,9 +29,9 @@ preflight_ceph_osd_min_gib: 40
 # Worker count of the guide table; fewer workers only produce a warning.
 preflight_recommended_workers: 4
 
-# false skips the existence and checksum checks of the NKP CLI binary on the
-# control machine (set by verify_hosts.yml, which installs nothing).
-preflight_check_nkp_binary: true
+# false skips the existence, checksum and content checks of the NKP CLI bundle
+# on the control machine (set by verify_hosts.yml, which installs nothing).
+preflight_check_nkp_cli: true
 
 # Longest wait, in seconds, for cloud-init to finish on a freshly created host.
 preflight_cloud_init_timeout: 1200

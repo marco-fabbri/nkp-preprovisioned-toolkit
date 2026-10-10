@@ -29,12 +29,16 @@ The validation status of the current revision is stated in
 - OpenTofu provisioning modules under `tofu/<provider>/` with one contract and a
   shared layout module: Proxmox, Nutanix AHV, standalone ESXi (free licence
   included) and vSphere, plus the contract test `./deploy.sh tofu-verify`.
+- NKP CLI installed from the Linux amd64 bundle of the Support Portal, verified
+  against the SHA-256 the portal publishes (`nkp_version`, `nkp_archive_sha256`),
+  one directory per release on the jump host with `/usr/local/bin/nkp` pointing at
+  the release in use, and `nkp version` checked against `nkp_version`.
 
 ## Open items
 
 | ID | Item | Notes |
 |---|---|---|
-| BL-05 | Node-only preflight entry point for `add-worker` | Today the whole preflight role runs, so `downloads/nkp` and its checksums are still required at Day-2 |
+| BL-05 | Node-only preflight entry point for `add-worker` | Today the whole preflight role runs, so the NKP CLI bundle and its checksum are still required at Day-2 |
 | BL-06 | Run the CIS audit on a worker added on a `-cis` profile | The baseline is applied; the audit must be run by hand |
 | BL-07 | Single source for the node firewall rules | `node_prep` and the CIS tasks use the same variables but separate task files |
 | BL-08 | Lab validation of the opt-in host firewall on nodes | `cis_firewalld_on_nodes` / `cis_ufw_on_nodes` and `node_firewalld_masquerade=false` are untested on real hosts |
@@ -44,6 +48,7 @@ The validation status of the current revision is stated in
 | BL-14 | Automated rollback of a failed `add-worker` | Today the failure message prints the manual `kubectl` steps |
 | BL-17 | NKP installation on VMs created by `tofu/nutanix`, `tofu/esxi` and `tofu/vsphere` | Validated with `./deploy.sh tofu-verify` only |
 | BL-18 | Remove the directory shortcut data at `remove-worker` cleanup | With `local_volume_devices = []` the directories `/var/local-disks/volN` and their bind mounts are left on the host |
+| BL-20 | Upgrade to a later NKP release driven by the toolkit | An upgrade needs the CLI of the target release (set `nkp_version`: it is installed next to the current one), then `nkp upgrade kommander` and `nkp upgrade cluster` in the order of the guide; needs a lab with two releases |
 
 ## Out of scope
 

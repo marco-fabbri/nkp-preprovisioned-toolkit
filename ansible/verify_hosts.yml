@@ -24,13 +24,13 @@
 #   contract_local_volume_min_gib=1  smallest local volume device accepted here, in GiB
 # ==============================================================================
 
-# The NKP CLI binary is not needed to verify hosts.
+# The NKP CLI bundle is not needed to verify hosts.
 - name: Preflight checks on every host
   hosts: all
   become: true
   gather_facts: true
   vars:
-    preflight_check_nkp_binary: false
+    preflight_check_nkp_cli: false
   roles:
     - role: common
     - role: preflight
