@@ -251,12 +251,31 @@
   changed_when: false
   failed_when: false
 
+# Opt-in (kommander_deploy_banner_show_credentials): the dashboard credentials
+# grant cluster-admin and Ansible output often ends up in a log or on a shared
+# screen, so by default the banner prints the command that reads them instead.
+# no_log hides them in this task's output; the banner prints them on purpose.
+- name: Read the dashboard credentials for the summary banner
+  ansible.builtin.command:
+    argv:
+      - nkp
+      - get
+      - dashboard
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+  become: false
+  register: kommander_deploy_dashboard_credentials
+  when: kommander_deploy_banner_show_credentials | bool
+  changed_when: false
+  failed_when: false
+  no_log: true
+
 # The License resource never carries the licence id, even once a licence is
 # activated: the tier tells the two states apart. Pro is the default key NKP
 # assigns on non-Nutanix infrastructure; any other valid tier was activated.
 - name: Compose the summary banner
   ansible.builtin.set_fact:
-    kommander_deploy_banner_access: "{{ banner_access }}"
+    kommander_deploy_banner_access: "{{ banner_access_head + banner_dashboard_credentials + banner_access_tail }}"
     kommander_deploy_banner_license_activated: "{{ banner_license_activated | bool }}"
     kommander_deploy_banner_license_activated_lines: "{{ banner_license_activated_lines }}"
     kommander_deploy_banner_license_default_lines: "{{ banner_license_default_lines }}"
@@ -288,7 +307,23 @@
         else (kommander_deploy_license_status_out.stdout_lines | default([], true) | join('; ')
               | default('no License resource found in namespace kommander', true))
       }}
-    banner_access:
+    # Split rather than regex_search, as for the licence tier below.
+    banner_dashboard_output: "{{ kommander_deploy_dashboard_credentials.stdout_lines | default([], true) }}"
+    banner_dashboard_user: >-
+      {{ banner_dashboard_output | select('match', '^Username: ') | map('regex_replace', '^Username: *', '')
+         | first | default('', true) | trim }}
+    banner_dashboard_password: >-
+      {{ banner_dashboard_output | select('match', '^Password: ') | map('regex_replace', '^Password: *', '')
+         | first | default('', true) | trim }}
+    banner_dashboard_show: >-
+      {{ (kommander_deploy_banner_show_credentials | bool)
+         and (kommander_deploy_dashboard_credentials.rc | default(1)) == 0
+         and banner_dashboard_user | length > 0 and banner_dashboard_password | length > 0 }}
+    banner_dashboard_credentials: >-
+      {{ ['Dashboard username: ' ~ banner_dashboard_user, 'Dashboard password: ' ~ banner_dashboard_password]
+         if banner_dashboard_show | bool
+         else ['Dashboard credentials (run on the jump host): nkp get dashboard --kubeconfig ' ~ cluster_kubeconfig] }}
+    banner_access_head:
       - "{{ banner_rule }}"
       - "{{ 'NKP PREPROVISIONED CLUSTER DEPLOYED SUCCESSFULLY' if banner_all_ready | bool
             else 'NKP CLUSTER CREATED - KOMMANDER STILL CONVERGING ('
@@ -303,7 +338,7 @@
       - "Control Plane API VIP: https://{{ control_plane_vip }}:6443"
       - "{{ 'NKP Dashboard: https://' ~ banner_ingress_ip ~ '/dkp/kommander/dashboard' if banner_ingress_ready | bool
             else 'NKP Dashboard: pending - no external IP on service kommander/kommander-traefik after 10 minutes' }}"
-      - "Dashboard credentials (run on the jump host): nkp get dashboard --kubeconfig {{ cluster_kubeconfig }}"
+    banner_access_tail:
       - "Kommander applications: {{ banner_apps_summary }}"
       - "Application status (run on the jump host): kubectl --kubeconfig {{ cluster_kubeconfig }} -n kommander get helmreleases"
       - "Kubeconfig on the jump host: {{ cluster_kubeconfig }}"

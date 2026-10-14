@@ -18,3 +18,9 @@ kommander_deploy_installer_config: "{{ nkp_workdir }}/kommander.yaml"
 # apps.<name>.enabled / values, ...). In inventory.ini write it as a JSON
 # object on one line; with -e use the JSON form.
 kommander_deploy_installer_overrides: {}
+
+# Print the NKP dashboard username and password in the summary banner (true),
+# or the "nkp get dashboard" command that reads them on the jump host (false).
+# The credentials grant cluster-admin: keep false where the Ansible output is
+# logged, archived or shown on a shared screen.
+kommander_deploy_banner_show_credentials: false

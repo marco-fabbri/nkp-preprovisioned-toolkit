@@ -537,6 +537,7 @@ Preflight checks that every host really runs the declared distribution.
 | `tofu_sizing_profile` | `pro-ultimate` | `sizing_profile` passed by the `tofu-*` commands of `deploy.sh`: `pro-ultimate` or `contract-test` (read from `inventory.ini`, not by Ansible); the generated inventory records the profile the VMs were created with |
 | `node_prep_remove_legacy_konvoy_user` | `true` | Remove the `konvoy` account created by earlier revisions of this toolkit |
 | `kommander_deploy_installer_overrides` | `{}` | Customisations merged last into the generated `kommander.yaml`, see [Kommander installer configuration](#kommander-installer-configuration) |
+| `kommander_deploy_banner_show_credentials` | `false` | `true`: the summary banner prints the dashboard username and password. `false`: it prints the `nkp get dashboard` command that reads them on the jump host. See [Security considerations](#security-considerations) |
 | `cis_extra_trusted_cidrs`, `cis_audit_strict` | `[]`, `true` | `-cis` profiles only, see [cis/README.md](cis/README.md) |
 
 The shared defaults are in `ansible/roles/common/defaults/main.yml`.
@@ -672,8 +673,11 @@ Variants:
   line reports `pending`.
 - The licence status line reads `unknown (the license query failed)` or
   `no License resource found in namespace kommander` when that is the case.
-- Passwords and dashboard credentials are never printed. Get the
-  dashboard credentials with the `nkp get dashboard` command shown in the banner.
+- By default the dashboard credentials are not printed: the banner shows the
+  `nkp get dashboard` command and the absolute path of the kubeconfig on the jump
+  host. With `kommander_deploy_banner_show_credentials = true` it prints the
+  username and password in their place (if the command fails, it falls back to the
+  command). Host passwords are never printed.
 
 If an application stays not ready, check it with the `kubectl ... get helmreleases`
 command printed in the banner. A slow start can make Flux mark a release as stalled
@@ -874,6 +878,10 @@ Read this before using the toolkit outside an isolated lab.
   with the same addresses, but connections are not protected against a host
   impersonating a node. On a network you do not fully trust, enable host key
   checking as described in the comments of `ansible/ansible.cfg`.
+- **Dashboard credentials in the banner.** `kommander_deploy_banner_show_credentials
+  = true` prints the dashboard username and password, which grant cluster-admin,
+  in the Ansible output. Keep the default `false` wherever that output is logged,
+  archived or shown on a shared screen.
 - **Secrets on disk.** `inventory.ini` can hold the password:
   keep it `chmod 600`. It is gitignored, like the fetched kubeconfig
   (`<cluster_name>.conf`, cluster-admin), `licenses/`, key files and the OpenTofu
@@ -905,6 +913,8 @@ a failed task and the checks listed in the row held.
 | `tofu/nutanix` contract test, Prism Central 7.6 on a single-node AHV cluster, `contract-test` VMs, 2026-10-08 | Passed for Rocky Linux 9 and Ubuntu 24.04 on a subnet without IPAM, and for Ubuntu 24.04 on a subnet with AHV IPAM (addresses inside the pool; the VIP answered both inside and outside the pool). Changing the OS rebuilt the VMs; a plan right after an apply showed no changes |
 | `tofu/esxi` contract test, ESXi 8.0 Update 3e with the free licence (vSphere 8 Hypervisor) and ESXi 8.0 Update 3 in evaluation, 2026-10-08/09 | Passed for Rocky Linux 9 and Ubuntu 24.04. Changing the OS rebuilt the base disk and the VMs; an apply interrupted during a disk copy recovered on the next run; a second OpenTofu state creating the same VM names on the same host was refused and left the first lab untouched; destroy left the datastore empty |
 | Licence activation in the NKP dashboard with an NKP Ultimate key issued for the Cluster UUID the summary prints, 2026-10-09 | Passed: the dashboard reported the licence as valid with its expiry and core usage, and `./deploy.sh install --tags kommander_deploy` printed the activated tier read from the cluster. A key issued for the UID of the `kube-system` namespace was rejected ("License key is not valid for this cluster"): the Cluster UUID is the UID of the Cluster API cluster object |
+| Fresh installation from scratch of v1.0.1 on VMs rebuilt by `tofu/proxmox` (`pro-ultimate`, `ubuntu`, guide disk layout), no licence, 2026-10-13 | Passed in 48 min with no failed task. 38 of 38 HelmReleases Ready a few minutes after the banner (Ceph was still creating its monitors when it printed), Ceph `HEALTH_OK` with four OSDs, 15 of 15 PersistentVolumeClaims bound, default `Pro` licence reported |
+| Summary banner with `kommander_deploy_banner_show_credentials` set to `false` and to `true`, 2026-10-14 | Passed: `false` printed the `nkp get dashboard` command and the kubeconfig path; `true` printed the username and password, which appeared once in the Ansible output (the task that reads them runs with `no_log`). The fallback to the command when `nkp get dashboard` fails was checked on simulated results with ansible-core 2.21.4 and 2.21.5 |
 | `tofu/vsphere` contract test, vCenter 8.0 Update 3 (VCSA tiny) with one ESXi 8.0 Update 3 host, 2026-10-09 | Passed for Ubuntu 24.04 and Rocky Linux 9 (OVA built from the cloud image, content library clone, cidata ISO). Changing the OS rebuilt the image and the VMs; a plan right after an apply showed no changes |
 
 Not verified: hosts below the Pro and Ultimate requirements (lowered `preflight_*`

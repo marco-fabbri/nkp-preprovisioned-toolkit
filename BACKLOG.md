@@ -33,6 +33,9 @@ The validation status of the current revision is stated in
   against the SHA-256 the portal publishes (`nkp_version`, `nkp_archive_sha256`),
   one directory per release on the jump host with `/usr/local/bin/nkp` pointing at
   the release in use, and `nkp version` checked against `nkp_version`.
+- Summary banner with the dashboard credentials as an opt-in
+  (`kommander_deploy_banner_show_credentials`); by default it prints the
+  `nkp get dashboard` command and the absolute path of the kubeconfig.
 
 ## Open items
 
