@@ -1,0 +1,50 @@
+---
+# ==============================================================================
+# Role Defaults: cluster_upgrade
+# ==============================================================================
+# The target is the NKP release set in nkp_version (inventory.ini). The role
+# runs on the jump host with the CLI of that release, installed by the
+# jump_host role, and moves the cluster one minor release at a time (the NKP
+# guide allows no skipped minor release): Kommander, then the cluster addons,
+# then the control plane, then each node pool.
+
+# NKP CLI of the target release (the upgrade requires the CLI of the release
+# it upgrades to).
+cluster_upgrade_nkp: "{{ nkp_cli_install_dir }}/{{ nkp_version }}/nkp"
+
+# Kubernetes release the control plane and the node pools move to: the default
+# release of the target NKP release (nkp_kubernetes_versions, role "common").
+cluster_upgrade_kubernetes_version: "{{ nkp_kubernetes_version }}"
+
+# Timeouts of "nkp upgrade kommander", in minutes (CLI defaults: 20 and 60).
+# The CLI waits for the core applications, then for the platform applications.
+cluster_upgrade_core_app_timeout_minutes: 30
+cluster_upgrade_platform_apps_timeout_minutes: 90
+
+# Timeouts of the Kubernetes rollouts, in minutes (CLI default: 30). Cluster
+# API replaces the nodes one at a time: in the lab 5-7 minutes per node on
+# Ubuntu and 20-30 on Rocky Linux, plus, for a worker, the time Rook Ceph needs
+# to recover before its disruption budget lets the next worker drain. The node
+# pool timeout is per worker of the pool.
+cluster_upgrade_controlplane_timeout_minutes: 150
+cluster_upgrade_nodepool_timeout_minutes_per_worker: 45
+
+# Health gates before the first change and before each node pool: every
+# HelmRelease of namespace kommander Ready, every node Ready, Rook Ceph
+# HEALTH_OK. Ceph is polled retries x delay seconds.
+cluster_upgrade_helmrelease_timeout: 15m
+cluster_upgrade_ceph_retries: 40
+cluster_upgrade_ceph_delay: 30
+
+# true stops after reading the cluster and printing what the upgrade would do
+# (the jump host still gets the CLI and kubectl of the target release).
+cluster_upgrade_plan_only: false
+
+# true proceeds when a HelmRelease is not Ready or Rook Ceph is not HEALTH_OK
+# (unreachable nodes still stop the run).
+cluster_upgrade_force: false
+
+# NKP 2.19 and later keep the Nutanix Docker Hub credentials in a Secret per
+# cluster. They are written when missing; true writes them on every run
+# ("nkp update cluster nutanix-registry-credentials" sets or rotates them).
+cluster_upgrade_rotate_registry_credentials: false

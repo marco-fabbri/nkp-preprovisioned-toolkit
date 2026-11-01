@@ -91,9 +91,17 @@
         path: "{{ cluster_kubeconfig }}"
         state: absent
 
+    # NKP 2.19 and later receive the Nutanix Docker Hub credentials on the
+    # command line (the CLI reads them from no file or variable): no_log keeps
+    # them out of the output, and they stay visible to other local users of
+    # the jump host in the process list while the command runs.
     - name: Execute nkp create cluster preprovisioned (self-managed)
-      ansible.builtin.command:
-        argv:
+      vars:
+        cluster_deploy_registry_args: >-
+          {{ ['--nutanix-registry-username', nutanix_registry_username,
+              '--nutanix-registry-password', nutanix_registry_password]
+             if nutanix_registry_credentials_supported | bool else [] }}
+        cluster_deploy_create_argv:
           - nkp
           - create
           - cluster
@@ -123,20 +131,29 @@
           - --timeout
           - "{{ cluster_deploy_create_timeout_minutes | int }}m"
           - --self-managed
+      ansible.builtin.command:
+        argv: "{{ cluster_deploy_create_argv + cluster_deploy_registry_args }}"
         chdir: "{{ nkp_workdir }}"
       async: "{{ cluster_deploy_create_timeout_minutes | int * 60 + 600 }}"
       poll: 15
       register: cluster_deploy_nkp_create
       changed_when: true
+      no_log: "{{ nutanix_registry_credentials_supported | bool }}"
   rescue:
     # The KIND bootstrap container is left in place: before the pivot it holds
     # the Cluster API objects and controller logs needed for diagnosis.
+    # The failed result keeps the real output even under no_log; the registry
+    # password is masked in case the CLI echoes it.
     - name: Report the nkp create cluster failure
+      vars:
+        cluster_deploy_create_output: >-
+          {{ (ansible_failed_result.stderr_lines | default([ansible_failed_result.msg | default('no output')]))[-15:] | join(' | ') }}
       ansible.builtin.fail:
         msg: >-
           'nkp create cluster preprovisioned' failed
           (rc={{ ansible_failed_result.rc | default('n/a') }}):
-          {{ (ansible_failed_result.stderr_lines | default([ansible_failed_result.msg | default('no output')]))[-15:] | join(' | ') }}.
+          {{ cluster_deploy_create_output | replace(nutanix_registry_password, '****')
+             if nutanix_registry_password | length > 0 else cluster_deploy_create_output }}.
           The KIND bootstrap container 'konvoy-capi-bootstrapper-control-plane' was left on the jump host
           for diagnosis, e.g.: docker exec konvoy-capi-bootstrapper-control-plane
           kubectl --kubeconfig /etc/kubernetes/admin.conf get clusters,machines -A.

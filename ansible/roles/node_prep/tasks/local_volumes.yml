@@ -17,15 +17,29 @@
       expects dedicated disks of at least {{ local_volume_min_gib }} GiB per worker, mounted under
       {{ local_volume_mount_prefix | dirname }}.
 
-- name: Create mount directories for localvolumeprovisioner (vol1-vol10)
+# Missing directories only: an existing one is the root of a volume (or the
+# mount point showing it), whose owner and mode kubelet sets for the pods using
+# it (fsGroup), and resetting them would take the pods' write access away.
+- name: Check the mount directories for localvolumeprovisioner (vol1-vol10)
   when: local_volume_devices | length == 0
-  ansible.builtin.file:
+  ansible.builtin.stat:
     path: "{{ item }}"
-    state: directory
-    mode: '0755'
   loop: "{{ [local_volume_mount_prefix, '/var/local-disks/vol'] | product(range(1, 11)) | map('join') | list }}"
   loop_control:
     label: "{{ item }}"
+  register: node_prep_shortcut_dirs
+
+- name: Create the missing mount directories for localvolumeprovisioner
+  when:
+    - local_volume_devices | length == 0
+    - not item.stat.exists
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    state: directory
+    mode: '0755'
+  loop: "{{ node_prep_shortcut_dirs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
 
 - name: Configure persistent bind mounts in /etc/fstab for localvolumeprovisioner
   when: local_volume_devices | length == 0

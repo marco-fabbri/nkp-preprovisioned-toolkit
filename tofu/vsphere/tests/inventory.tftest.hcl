@@ -39,7 +39,8 @@ variables {
 
 # Values measured on vCenter 8.0U3 (nested ESXi 8.0U3): vmxnet3 is ens192 on
 # Ubuntu and eth0 on Rocky GenericCloud (net.ifnames=0); the PVSCSI disks are
-# pci-0000:03:00.0-scsi-0:0:<unit>:0, as on a standalone ESXi.
+# pci-0000:03:00.0-scsi-0:0:<unit>:0, as on a standalone ESXi (measured with
+# units 1 to 5; unit 6, the fifth local volume, follows the same pattern).
 run "inventory_uses_the_measured_vsphere_names_on_ubuntu" {
   command = plan
   assert {
@@ -47,8 +48,8 @@ run "inventory_uses_the_measured_vsphere_names_on_ubuntu" {
     error_message = "Ubuntu on vSphere: ens192 and the SCSI unit 1 path"
   }
   assert {
-    condition     = strcontains(output.ansible_inventory, "\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:2:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:3:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:4:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:5:0\"")
-    error_message = "local volumes must be SCSI units 2 to 5"
+    condition     = strcontains(output.ansible_inventory, "\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:2:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:3:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:4:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:5:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:6:0\"")
+    error_message = "local volumes must be SCSI units 2 to 6"
   }
 }
 
@@ -72,8 +73,8 @@ run "rocky_uses_eth0" {
 run "worker_disk_layout" {
   command = plan
   assert {
-    condition     = [for d in vsphere_virtual_machine.worker[0].disk : d.unit_number] == [0, 1, 2, 3, 4, 5] && length(vsphere_virtual_machine.jump_host.disk) == 1
-    error_message = "worker: OS + Ceph + 4 volumes on units 0..5; jump host: OS only"
+    condition     = [for d in vsphere_virtual_machine.worker[0].disk : d.unit_number] == [0, 1, 2, 3, 4, 5, 6] && length(vsphere_virtual_machine.jump_host.disk) == 1
+    error_message = "worker: OS + Ceph + 5 volumes on units 0..6; jump host: OS only"
   }
   assert {
     condition     = vsphere_virtual_machine.worker[0].disk[1].size == 5 && vsphere_virtual_machine.worker[0].disk[5].size == 5 && vsphere_virtual_machine.worker[0].disk[0].size == 20

@@ -22,9 +22,9 @@ module "layout" {
     Worker disks created by this module, named by their serial number through
     the stable /dev/disk/by-id links (kernel names such as sdb do not follow the
     SCSI slot and can change at reboot): nkp-ceph = raw Ceph OSD
-    ({ceph_gb} GB), nkp-vol1..nkp-vol4 = local volumes 1..4
+    ({ceph_gb} GB), nkp-vol1..nkp-vol5 = local volumes 1..5
     ({volume_gb} GB each)
   EOT
   ceph_osd_device      = "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-ceph"
-  local_volume_devices = [for i in range(4) : format("/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol%d", i + 1)]
+  local_volume_devices = [for i in range(5) : format("/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol%d", i + 1)]
 }

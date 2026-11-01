@@ -1,0 +1,56 @@
+---
+# "nkp upgrade kommander" upgrades the management plane: Kommander, the Cluster
+# API components (a separate step before NKP 2.19) and the platform
+# applications of the management cluster. It needs the CLI of the target
+# release.
+
+- name: Run nkp upgrade kommander
+  block:
+    - name: Run nkp upgrade kommander to release {{ nkp_version }}
+      ansible.builtin.command:
+        argv:
+          - "{{ cluster_upgrade_nkp }}"
+          - upgrade
+          - kommander
+          - --kubeconfig
+          - "{{ cluster_kubeconfig }}"
+          - --core-app-timeout
+          - "{{ cluster_upgrade_core_app_timeout_minutes | int }}m"
+          - --platform-apps-timeout
+          - "{{ cluster_upgrade_platform_apps_timeout_minutes | int }}m"
+        chdir: "{{ nkp_workdir }}"
+      async: >-
+        {{ (cluster_upgrade_core_app_timeout_minutes | int + cluster_upgrade_platform_apps_timeout_minutes | int) * 60
+           + 1800 }}
+      poll: 30
+      register: cluster_upgrade_kommander_run
+      changed_when: true
+  rescue:
+    - name: Report the nkp upgrade kommander failure
+      ansible.builtin.fail:
+        msg: >-
+          'nkp upgrade kommander' failed (rc={{ ansible_failed_result.rc | default('n/a') }}):
+          {{ (ansible_failed_result.stderr_lines | default([ansible_failed_result.msg | default('no output')]))[-15:]
+             | join(' | ') }}.
+          The command can be run again: ./deploy.sh upgrade resumes from the first step not completed. For more
+          detail run it by hand on the jump host with -v 6 ({{ cluster_upgrade_nkp }} upgrade kommander
+          --kubeconfig {{ cluster_kubeconfig }} -v 6).
+
+- name: Read the Kommander release after the upgrade
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: kommander_version
+
+- name: Verify Kommander runs release {{ nkp_version }}
+  ansible.builtin.assert:
+    that:
+      - common_kommander_version == nkp_version
+    fail_msg: >-
+      'nkp upgrade kommander' returned without error, but the kommander HelmRelease reports release
+      '{{ common_kommander_version }}', not {{ nkp_version }}. Check kubectl -n kommander get helmrelease kommander.
+    quiet: true
+
+- name: Check the cluster health after the Kommander upgrade
+  ansible.builtin.include_tasks: health.yml
+  vars:
+    cluster_upgrade_health_stage: after the Kommander upgrade

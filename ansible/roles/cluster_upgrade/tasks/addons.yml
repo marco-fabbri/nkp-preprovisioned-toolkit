@@ -1,0 +1,26 @@
+---
+# Core addons of the cluster (CNI, CSI, cluster autoscaler, node feature
+# discovery, ...), applied as ClusterResourceSets: the CLI returns once they
+# are applied and the DaemonSets roll out on their own. Manual changes to those
+# ClusterResourceSets are not kept.
+
+- name: Run nkp upgrade addons preprovisioned
+  ansible.builtin.command:
+    argv:
+      - "{{ cluster_upgrade_nkp }}"
+      - upgrade
+      - addons
+      - preprovisioned
+      - --cluster-name
+      - "{{ cluster_name }}"
+      - --namespace
+      - "{{ cluster_upgrade_namespace }}"
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+    chdir: "{{ nkp_workdir }}"
+  register: cluster_upgrade_addons_run
+  changed_when: true
+
+- name: Report the upgraded addons
+  ansible.builtin.debug:
+    var: cluster_upgrade_addons_run.stdout_lines

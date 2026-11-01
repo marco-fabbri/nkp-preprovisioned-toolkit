@@ -1,0 +1,134 @@
+---
+# Health gate: every node Ready, every HelmRelease of namespace kommander
+# Ready, Rook Ceph HEALTH_OK. With cluster_upgrade_force=true the HelmRelease
+# and Ceph checks only warn. Input: cluster_upgrade_health_stage, the moment of
+# the check, for the messages.
+#
+# The node check also counts the nodes: at least one per replica of the
+# control plane and of the node pools (discover.yml). A machine being replaced
+# has no node, and its absence is not a node that is not Ready.
+
+- name: Wait for every node to be Ready ({{ cluster_upgrade_health_stage }})
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'nodes', '-o', cluster_upgrade_health_jsonpath] }}"
+  vars:
+    cluster_upgrade_health_jsonpath: >-
+      jsonpath={range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}
+    cluster_upgrade_health_expected_nodes: >-
+      {{ cluster_upgrade_kcp_replicas | int + cluster_upgrade_nodepools | map(attribute='replicas') | map('int') | sum }}
+  register: cluster_upgrade_health_nodes
+  until:
+    - cluster_upgrade_health_nodes.rc == 0
+    - cluster_upgrade_health_nodes.stdout_lines | reject('match', '.* True$') | list | length == 0
+    - cluster_upgrade_health_nodes.stdout_lines | length >= cluster_upgrade_health_expected_nodes | int
+  retries: 20
+  delay: 30
+  changed_when: false
+  failed_when: false
+
+- name: Stop when a node is not Ready or missing ({{ cluster_upgrade_health_stage }})
+  vars:
+    cluster_upgrade_health_expected_nodes: >-
+      {{ cluster_upgrade_kcp_replicas | int + cluster_upgrade_nodepools | map(attribute='replicas') | map('int') | sum }}
+  ansible.builtin.assert:
+    that:
+      - cluster_upgrade_health_nodes.rc == 0
+      - cluster_upgrade_health_nodes.stdout_lines | reject('match', '.* True$') | list | length == 0
+      - cluster_upgrade_health_nodes.stdout_lines | length >= cluster_upgrade_health_expected_nodes | int
+    fail_msg: >-
+      {{ ('Nodes not Ready ' ~ cluster_upgrade_health_stage ~ ': '
+          ~ (cluster_upgrade_health_nodes.stdout_lines | reject('match', '.* True$') | join(', ') or 'none')
+          ~ '. ' ~ (cluster_upgrade_health_nodes.stdout_lines | length) ~ ' node(s), '
+          ~ cluster_upgrade_health_expected_nodes ~ ' expected (control plane and node pool replicas)')
+         if cluster_upgrade_health_nodes.rc == 0 else cluster_upgrade_health_nodes.stderr | default('') }}.
+      Check kubectl get nodes and kubectl get machines -A before running the upgrade again.
+    quiet: true
+
+# kubectl wait without --request-timeout: that flag would also cut its watch.
+- name: Wait for the HelmReleases of namespace kommander to be Ready ({{ cluster_upgrade_health_stage }})
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - -n
+      - kommander
+      - wait
+      - --for=condition=Ready
+      - helmreleases.helm.toolkit.fluxcd.io
+      - --all
+      - --timeout={{ cluster_upgrade_helmrelease_timeout }}
+  register: cluster_upgrade_health_hr_wait
+  changed_when: false
+  failed_when: false
+
+- name: Read the HelmReleases that are not Ready
+  when: cluster_upgrade_health_hr_wait.rc != 0
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['-n', 'kommander', 'get', 'helmreleases.helm.toolkit.fluxcd.io', '-o', cluster_upgrade_health_jsonpath] }}"
+  vars:
+    cluster_upgrade_health_jsonpath: >-
+      jsonpath={range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}
+  register: cluster_upgrade_health_hr
+  changed_when: false
+
+- name: Report the HelmReleases that are not Ready ({{ cluster_upgrade_health_stage }})
+  when: cluster_upgrade_health_hr_wait.rc != 0
+  vars:
+    cluster_upgrade_health_hr_bad: >-
+      {{ cluster_upgrade_health_hr.stdout_lines | reject('match', '.* True$') | map('split', ' ') | map('first') | list }}
+  ansible.builtin.assert:
+    that:
+      - cluster_upgrade_force | bool
+    fail_msg: >-
+      HelmReleases not Ready in namespace kommander {{ cluster_upgrade_health_stage }} after
+      {{ cluster_upgrade_helmrelease_timeout }}: {{ cluster_upgrade_health_hr_bad | join(', ') or 'none listed' }}.
+      Check kubectl -n kommander get helmreleases, fix them, and run the upgrade again
+      (-e cluster_upgrade_force=true proceeds anyway).
+    success_msg: >-
+      WARNING: HelmReleases not Ready in namespace kommander {{ cluster_upgrade_health_stage }}:
+      {{ cluster_upgrade_health_hr_bad | join(', ') or 'none listed' }}; continuing because cluster_upgrade_force=true.
+    quiet: false
+
+- name: Check whether Rook Ceph is installed
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'crd', 'cephclusters.ceph.rook.io', '--ignore-not-found', '-o', 'name'] }}"
+  register: cluster_upgrade_health_ceph_crd
+  changed_when: false
+
+# Rook Ceph restarts its daemons while Kommander is upgraded and loses one OSD
+# for every worker being replaced: each node pool waits for HEALTH_OK first.
+- name: Wait for Rook Ceph to report HEALTH_OK ({{ cluster_upgrade_health_stage }})
+  when: cluster_upgrade_health_ceph_crd.stdout | trim | length > 0
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'cephclusters.ceph.rook.io', '-A', '-o', cluster_upgrade_health_jsonpath] }}"
+  vars:
+    cluster_upgrade_health_jsonpath: >-
+      jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}={.status.ceph.health}{"\n"}{end}
+  register: cluster_upgrade_health_ceph
+  until:
+    - cluster_upgrade_health_ceph.rc == 0
+    - cluster_upgrade_health_ceph.stdout_lines | reject('match', '.*=HEALTH_OK$') | list | length == 0
+  retries: "{{ cluster_upgrade_ceph_retries | int }}"
+  delay: "{{ cluster_upgrade_ceph_delay | int }}"
+  changed_when: false
+  failed_when: false
+
+- name: Report the Rook Ceph health ({{ cluster_upgrade_health_stage }})
+  when:
+    - cluster_upgrade_health_ceph_crd.stdout | trim | length > 0
+    - >-
+      cluster_upgrade_health_ceph.rc != 0
+      or cluster_upgrade_health_ceph.stdout_lines | reject('match', '.*=HEALTH_OK$') | list | length > 0
+  ansible.builtin.assert:
+    that:
+      - cluster_upgrade_force | bool
+    fail_msg: >-
+      Rook Ceph is not HEALTH_OK {{ cluster_upgrade_health_stage }}:
+      {{ cluster_upgrade_health_ceph.stdout_lines | join(', ') or cluster_upgrade_health_ceph.stderr | default('') }}.
+      Replacing a worker takes its OSD offline: wait for HEALTH_OK (kubectl get cephclusters.ceph.rook.io -A)
+      and run the upgrade again (-e cluster_upgrade_force=true proceeds anyway).
+    success_msg: >-
+      WARNING: Rook Ceph is not HEALTH_OK {{ cluster_upgrade_health_stage }}
+      ({{ cluster_upgrade_health_ceph.stdout_lines | join(', ') }}); continuing because cluster_upgrade_force=true.
+    quiet: false

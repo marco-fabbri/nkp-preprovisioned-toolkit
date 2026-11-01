@@ -13,14 +13,14 @@ variables {
   nic_comment          = "Test NIC name"
   disk_comment         = "Ceph {ceph_gb} GB, volumes {volume_gb} GB"
   ceph_osd_device      = "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0"
-  local_volume_devices = ["/dev/v1", "/dev/v2", "/dev/v3", "/dev/v4"]
+  local_volume_devices = ["/dev/v1", "/dev/v2", "/dev/v3", "/dev/v4", "/dev/v5"]
 }
 
 run "pro_ultimate_sizes" {
   command = plan
   assert {
     condition     = output.sizing.worker_cores == 8 && output.sizing.worker_memory == 32768 && output.sizing.control_plane_memory == 16384
-    error_message = "pro-ultimate must match the NKP 2.18 Pro/Ultimate table"
+    error_message = "pro-ultimate must match the NKP Pro/Ultimate table"
   }
   assert {
     condition     = output.sizing.ceph_disk_gb == 50 && output.sizing.local_volume_gb == 110
@@ -99,10 +99,10 @@ run "rejects_two_control_planes" {
   expect_failures = [var.control_plane_ips]
 }
 
-run "rejects_three_volumes" {
+run "rejects_four_volumes" {
   command = plan
   variables {
-    local_volume_devices = ["/dev/v1", "/dev/v2", "/dev/v3"]
+    local_volume_devices = ["/dev/v1", "/dev/v2", "/dev/v3", "/dev/v4"]
   }
   expect_failures = [var.local_volume_devices]
 }

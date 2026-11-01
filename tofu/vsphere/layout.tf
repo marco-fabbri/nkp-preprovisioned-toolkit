@@ -22,7 +22,7 @@ module "layout" {
     Worker disks created by this module, named by their SCSI slot through the
     stable /dev/disk/by-path links (vSphere does not let the module set a disk
     serial; kernel names such as sdb can change at reboot): unit 1 = raw Ceph
-    OSD ({ceph_gb} GB), units 2..5 = local volumes 1..4 ({volume_gb} GB each)
+    OSD ({ceph_gb} GB), units 2..6 = local volumes 1..5 ({volume_gb} GB each)
   EOT
   ceph_osd_device      = var.guest_ceph_device
   local_volume_devices = var.guest_local_volume_devices

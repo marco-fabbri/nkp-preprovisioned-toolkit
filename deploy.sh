@@ -2,6 +2,9 @@
 # NKP Preprovisioned Toolkit - command wrapper.
 #
 #   ./deploy.sh [install] [options]      full installation (default command)
+#   ./deploy.sh upgrade [options]        upgrade the cluster to the NKP release of inventory.ini (nkp_version,
+#                                        one minor release at a time): Kommander, CAPI components and platform
+#                                        applications, cluster addons, control plane, then each node pool
 #   ./deploy.sh check [options]          preflight checks only
 #   ./deploy.sh ping [options]           SSH + sudo connectivity test (ansible ping)
 #   ./deploy.sh cis-harden [options]     apply the CIS Level 1 aligned baseline (subset of controls)
@@ -28,6 +31,11 @@
 # Settings that are lists (cis_extra_trusted_cidrs) need the JSON form of -e:
 #   ./deploy.sh cis-harden -e '{"cis_extra_trusted_cidrs": ["10.20.0.0/24"]}'
 #
+# NKP 2.19 and later need the Nutanix Docker Hub credentials of the Support
+# Portal (install and upgrade): export NUTANIX_REGISTRY_USERNAME and
+# NUTANIX_REGISTRY_PASSWORD, or write them as KEY=value lines in the gitignored
+# .env of the repository root (an exported variable wins over the file).
+#
 # tofu-* commands: the provider (proxmox, esxi, vsphere or nutanix) is
 # TOFU_PROVIDER, else tofu_provider in inventory.ini, else proxmox. Plan and
 # apply of esxi and vsphere also need qemu-img, curl and an ISO tool on this
@@ -41,6 +49,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INVENTORY="$REPO_ROOT/inventory.ini"
 PLAYBOOK="$REPO_ROOT/ansible/site.yml"
+UPGRADE_PLAYBOOK="$REPO_ROOT/ansible/upgrade.yml"
+ENV_FILE="$REPO_ROOT/.env"
 VERIFY_PLAYBOOK="$REPO_ROOT/ansible/verify_hosts.yml"
 CIS_HARDEN_PLAYBOOK="$REPO_ROOT/cis/ansible/cis_hardening.yml"
 CIS_AUDIT_PLAYBOOK="$REPO_ROOT/cis/ansible/cis_audit.yml"
@@ -57,6 +67,34 @@ inventory_var() {
     | head -n 1 | sed -e 's/[[:space:]]*#.*$//' -e 's/^["'"'"']//' -e 's/["'"'"'][[:space:]]*$//'
 }
 
+# Export the Nutanix Docker Hub credentials found in .env. The file is read, not
+# sourced: only the NUTANIX_REGISTRY_USERNAME and NUTANIX_REGISTRY_PASSWORD
+# lines are taken (other keys stay out of the Ansible environment), one pair of
+# surrounding quotes is dropped, and a variable already set in the shell wins.
+load_registry_credentials() {
+  [ -f "$ENV_FILE" ] || return 0
+  local env_perms line key value
+  env_perms=$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE")
+  if [ "$env_perms" != "600" ]; then
+    echo "note: .env holds credentials; consider: chmod 600 .env" >&2
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    line="${line#export }"
+    case "$line" in
+      NUTANIX_REGISTRY_USERNAME=*|NUTANIX_REGISTRY_PASSWORD=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$value" in
+      \"*\") value="${value#\"}"; value="${value%\"}" ;;
+      \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    [ -n "${!key:-}" ] || export "$key=$value"
+  done < "$ENV_FILE"
+}
+
 # No command, or options only: default to "install" and keep the options.
 case "${1:-}" in
   -h|--help|help) usage; exit 0 ;;
@@ -65,7 +103,7 @@ case "${1:-}" in
 esac
 
 case "$command_arg" in
-  install|check|ping|cis-harden|cis-audit|tofu-verify) ;;
+  install|upgrade|check|ping|cis-harden|cis-audit|tofu-verify) ;;
   add-worker|remove-worker)
     # The help of the Day-2 scripts needs neither inventory.ini nor Ansible.
     for arg in "$@"; do
@@ -181,6 +219,8 @@ for c in ansible.posix community.general community.crypto; do
   fi
 done
 
+load_registry_credentials
+
 # --- Run ----------------------------------------------------------------------
 cd "$REPO_ROOT/ansible"
 case "$command_arg" in
@@ -198,6 +238,9 @@ case "$command_arg" in
     ;;
   install)
     exec ansible-playbook -i "$INVENTORY" "$PLAYBOOK" "$@"
+    ;;
+  upgrade)
+    exec ansible-playbook -i "$INVENTORY" "$UPGRADE_PLAYBOOK" "$@"
     ;;
   tofu-verify)
     exec ansible-playbook -i "$INVENTORY" "$VERIFY_PLAYBOOK" -e preflight_skip_sizing=true "$@"

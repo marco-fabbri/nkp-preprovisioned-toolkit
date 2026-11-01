@@ -25,7 +25,7 @@ GenericCloud or Ubuntu 24.04 LTS), configured through cloud-init with a static
 IPv4 address, the DNS servers, the hostname and an OS user (`vm_user`, default
 `nutanix`) that accepts `ssh_public_key` and has passwordless sudo.
 
-Every worker gets the disk layout the NKP 2.18 guide expects, on one SCSI
+Every worker gets the disk layout the NKP guide expects, on one SCSI
 controller and always in this order; nothing is partitioned, formatted or
 mounted by the module, that is the Ansible roles' job:
 
@@ -33,7 +33,7 @@ mounted by the module, that is the Ansible roles' job:
 |---|---|---|---|
 | 1 | 0 | operating system | cloud image, grown to the profile size |
 | 2 | 1 | raw block device, no partition table, no file system | Rook Ceph OSD (`ceph_osd_device`) |
-| 3-6 | 2..5 | one file system each, mounted by UUID under `/mnt/disks/vol1..vol4` | local static provisioner (`local_volume_devices`, volume N = slot N+1) |
+| 3-7 | 2..6 | one file system each, mounted by UUID under `/mnt/disks/vol1..vol5` | local static provisioner (`local_volume_devices`, volume N = slot N+1) |
 
 The jump host and the control plane nodes have the OS disk only. The data
 disks are thin wherever the datastore allows it.
@@ -49,7 +49,7 @@ value per disk role and Rook Ceph gets a single filter:
 
 | Module | Stable link of the Ceph disk (slot 1) | How it is stable |
 |---|---|---|
-| `proxmox` | `/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-ceph` | disk serial set by the module (`nkp-ceph`, `nkp-vol1`..`nkp-vol4`) |
+| `proxmox` | `/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-ceph` | disk serial set by the module (`nkp-ceph`, `nkp-vol1`..`nkp-vol5`) |
 | `nutanix` | `/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:1:0` | SCSI slot of the AHV virtio-scsi controller |
 | `esxi` | `/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0` | SCSI unit of the PVSCSI controller |
 | `vsphere` | `/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0` | SCSI unit of the PVSCSI controller |
@@ -82,10 +82,10 @@ after its PCI slot.
 
 | Profile | Control plane | Worker | Expected layout (docs only) | OS disk | Ceph disk | Local volumes | Jump host |
 |---|---|---|---|---|---|---|---|
-| `pro-ultimate` (default) | 4 vCPU / 16384 MB | 8 vCPU / 32768 MB | 3 control planes, 4 workers | 80 GB | 50 GB | 4 x 110 GB | 4 vCPU / 8192 MB / 50 GB |
-| `contract-test` | 2 vCPU / 2048 MB | 2 vCPU / 2048 MB | 1 control plane, 1 worker | 20 GB | 5 GB | 4 x 5 GB | 2 vCPU / 2048 MB / 20 GB |
+| `pro-ultimate` (default) | 4 vCPU / 16384 MB | 8 vCPU / 32768 MB | 3 control planes, 4 workers | 80 GB | 50 GB | 5 x 110 GB | 4 vCPU / 8192 MB / 50 GB |
+| `contract-test` | 2 vCPU / 2048 MB | 2 vCPU / 2048 MB | 1 control plane, 1 worker | 20 GB | 5 GB | 5 x 5 GB | 2 vCPU / 2048 MB / 20 GB |
 
-`pro-ultimate` follows the Pro and Ultimate requirements of the NKP 2.18 guide,
+`pro-ultimate` follows the Pro and Ultimate requirements of the NKP guide (2.18 and 2.19),
 the sizes the Ansible preflight checks (pre-provisioned infrastructure requires
 one of those licences). The local volume disks get 110 GB because NKP needs
 more than 100 GiB on each of them: Prometheus claims exactly 100 GiB and the
@@ -299,7 +299,7 @@ What it does **not** validate:
 - VM IDs: `vm_id_base` for the jump host, `+1..+3` for the control planes,
   `+4` onwards for the workers; the worker IDs do not move when only one
   control plane is created.
-- The data disks carry the serials `nkp-ceph` and `nkp-vol1`..`nkp-vol4`; the
+- The data disks carry the serials `nkp-ceph` and `nkp-vol1`..`nkp-vol5`; the
   Proxmox cloud-init network configuration names the first NIC `eth0` on both
   images.
 

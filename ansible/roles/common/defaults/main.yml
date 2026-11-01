@@ -17,9 +17,29 @@ node_subnet_cidr: >-
 pod_cidr: "192.168.0.0/16"
 service_cidr: "10.96.0.0/12"
 
-# kubectl client installed on the jump host. Keep it within one minor version
-# of the Kubernetes release deployed by the NKP CLI (NKP 2.18.0 ships 1.35.2).
-kubectl_version: "v1.35.2"
+# Kubernetes release each supported NKP release deploys by default (the CLI
+# creates the cluster at that version when --kubernetes-version is not given).
+# The upgrade moves the cluster to the value of the target release.
+nkp_kubernetes_versions:
+  "2.18": "v1.35.2"
+  "2.19": "v1.36.2"
+nkp_minor: "{{ nkp_version | default('') | regex_replace('^([0-9]+\\.[0-9]+)\\..*$', '\\1') }}"
+nkp_kubernetes_version: "{{ nkp_kubernetes_versions[nkp_minor] | default('') }}"
+
+# kubectl client installed on the jump host: the Kubernetes release of the NKP
+# release in use, so the client stays within one minor version of the cluster.
+kubectl_version: "{{ nkp_kubernetes_version }}"
+
+# Nutanix Docker Hub credentials (NKP 2.19 and later). A connected cluster
+# without a registry mirror pulls its platform images from docker.io/nutanix
+# with them; the user name and access token come from the NKP downloads page of
+# the Nutanix Support Portal (at most two tokens per organisation). They are
+# read from the environment of the control machine, never from the inventory:
+# export them, or write them in the gitignored .env of the repository root,
+# which deploy.sh reads. NKP 2.18 does not know them and never gets them.
+nutanix_registry_username: "{{ lookup('ansible.builtin.env', 'NUTANIX_REGISTRY_USERNAME') }}"
+nutanix_registry_password: "{{ lookup('ansible.builtin.env', 'NUTANIX_REGISTRY_PASSWORD') }}"
+nutanix_registry_credentials_supported: "{{ nkp_version | default('0.0.0') is version('2.19.0', '>=') }}"
 
 # Password set for ansible_user on every host (console fallback).
 # Set it to an empty string to leave the existing password untouched.
@@ -46,7 +66,7 @@ cis_ufw_on_nodes: false
 # disables it. cis_firewalld_masquerade is the name used by earlier revisions.
 node_firewalld_masquerade: "{{ cis_firewalld_masquerade | default(true) }}"
 
-# Worker disk layout of the NKP 2.18 guide: the OS disk, one raw disk for the
+# Worker disk layout of the NKP guide: the OS disk, one raw disk for the
 # Rook Ceph OSD and dedicated disks for the local volume provisioner. The
 # toolkit never partitions a disk. Each value is either a kernel name without
 # /dev/ (sdb) or an absolute path (/dev/disk/by-id/..., /dev/disk/by-path/...),

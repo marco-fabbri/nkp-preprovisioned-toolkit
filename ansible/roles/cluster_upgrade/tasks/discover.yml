@@ -1,0 +1,249 @@
+---
+# Read the cluster: release of Kommander, Cluster API objects, nodes, and the
+# hosts Cluster API can use. Nothing is changed.
+
+- name: Set the kubectl command line
+  ansible.builtin.set_fact:
+    cluster_upgrade_kubectl: ['kubectl', '--kubeconfig', "{{ cluster_kubeconfig }}", '--request-timeout=60s']
+
+- name: Verify the cluster kubeconfig exists on the Jump Host
+  ansible.builtin.stat:
+    path: "{{ cluster_kubeconfig }}"
+  register: cluster_upgrade_kubeconfig
+
+- name: Stop when there is no cluster to upgrade
+  ansible.builtin.assert:
+    that:
+      - cluster_upgrade_kubeconfig.stat.exists
+      - cluster_upgrade_kubeconfig.stat.size > 0
+    fail_msg: >-
+      {{ cluster_kubeconfig }} is missing or empty on the jump host: there is no cluster '{{ cluster_name }}' to
+      upgrade. ./deploy.sh install creates a new cluster at release {{ nkp_version }}.
+    quiet: true
+
+# ------------------------------------------------------------------------------
+# Release path
+# ------------------------------------------------------------------------------
+- name: Read the Kommander release on the cluster
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: kommander_version
+
+# The NKP guide supports one minor release at a time (2.18.x to 2.19.x) and
+# patch releases within a minor release; it never goes back.
+- name: Validate the upgrade path
+  vars:
+    cluster_upgrade_src: "{{ common_kommander_version | regex_replace('^([0-9]+)\\.([0-9]+)\\..*$', '\\1 \\2') | split(' ') }}"
+    cluster_upgrade_dst: "{{ nkp_version | regex_replace('^([0-9]+)\\.([0-9]+)\\..*$', '\\1 \\2') | split(' ') }}"
+  ansible.builtin.assert:
+    that:
+      - common_kommander_version is match('^[0-9]+\.[0-9]+\.[0-9]+')
+      - common_kommander_version is version(nkp_version, '<=')
+      - cluster_upgrade_src[0] == cluster_upgrade_dst[0]
+      - (cluster_upgrade_dst[1] | int) - (cluster_upgrade_src[1] | int) in [0, 1]
+    fail_msg: >-
+      {{ ('Kommander was not found on cluster ' ~ cluster_name ~ ' (no HelmRelease kommander/kommander): the upgrade
+      needs a cluster installed by ./deploy.sh install.')
+         if common_kommander_version | length == 0 else
+         ('The cluster runs NKP ' ~ common_kommander_version ~ ' and nkp_version is ' ~ nkp_version ~ ': NKP upgrades
+         one minor release at a time and never downgrades. Set nkp_version (and nkp_archive_sha256) in inventory.ini
+         to the next minor release, run ./deploy.sh upgrade, and repeat up to the release you want.') }}
+    quiet: true
+
+- name: Set whether Kommander needs the upgrade
+  ansible.builtin.set_fact:
+    cluster_upgrade_source_version: "{{ common_kommander_version }}"
+    cluster_upgrade_kommander_pending: "{{ common_kommander_version != nkp_version }}"
+
+# ------------------------------------------------------------------------------
+# Cluster API objects
+# ------------------------------------------------------------------------------
+- name: Read the Cluster API clusters
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'clusters.cluster.x-k8s.io', '-A', '-o', 'json'] }}"
+  register: cluster_upgrade_clusters_raw
+  changed_when: false
+
+- name: Select the Cluster API cluster {{ cluster_name }}
+  ansible.builtin.set_fact:
+    cluster_upgrade_cluster_matches: >-
+      {{ (cluster_upgrade_clusters_raw.stdout | from_json)['items']
+         | selectattr('metadata.name', 'equalto', cluster_name) | list }}
+
+- name: Verify exactly one Cluster API cluster is named {{ cluster_name }}
+  ansible.builtin.assert:
+    that:
+      - cluster_upgrade_cluster_matches | length == 1
+    fail_msg: >-
+      Expected one Cluster API cluster named '{{ cluster_name }}', found {{ cluster_upgrade_cluster_matches | length }}
+      (kubectl get clusters.cluster.x-k8s.io -A). Check cluster_name in inventory.ini.
+    quiet: true
+
+# Every nkp command below receives this namespace: the CLI defaults to
+# "default", and the NKP guide places the management cluster in "kommander".
+- name: Register the namespace and control plane of the cluster
+  ansible.builtin.set_fact:
+    cluster_upgrade_namespace: "{{ cluster_upgrade_cluster_matches[0].metadata.namespace }}"
+    cluster_upgrade_kcp_name: "{{ cluster_upgrade_cluster_matches[0].spec.controlPlaneRef.name }}"
+
+- name: Read the control plane, the node pools and the host inventories
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['-n', cluster_upgrade_namespace, 'get', item, '-o', 'json'] }}"
+  loop:
+    - kubeadmcontrolplanes.controlplane.cluster.x-k8s.io
+    - machinedeployments.cluster.x-k8s.io
+    - preprovisionedinventories.infrastructure.cluster.konvoy.d2iq.io
+  register: cluster_upgrade_capi_raw
+  changed_when: false
+
+# One line per machine: node pool (empty for the control plane), release, node.
+- name: Read the machines of the cluster
+  ansible.builtin.command:
+    argv: >-
+      {{ cluster_upgrade_kubectl + ['-n', cluster_upgrade_namespace, 'get', 'machines.cluster.x-k8s.io',
+         '-l', 'cluster.x-k8s.io/cluster-name=' ~ cluster_name, '-o', cluster_upgrade_machines_jsonpath] }}
+  vars:
+    cluster_upgrade_machines_jsonpath: >-
+      jsonpath={range .items[*]}{.metadata.labels.cluster\.x-k8s\.io/deployment-name}{" "}{.spec.version}{" "}{.status.nodeRef.name}{"\n"}{end}
+  register: cluster_upgrade_machines_raw
+  changed_when: false
+
+# One line per node: name, kubelet release, status of the Ready condition.
+- name: Read the nodes
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'nodes', '-o', cluster_upgrade_nodes_jsonpath] }}"
+  vars:
+    cluster_upgrade_nodes_jsonpath: >-
+      jsonpath={range .items[*]}{.metadata.name}{" "}{.status.nodeInfo.kubeletVersion}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}
+  register: cluster_upgrade_nodes_raw
+  changed_when: false
+
+- name: Read the control plane nodes
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'nodes', '-l', 'node-role.kubernetes.io/control-plane', '-o', 'name'] }}"
+  register: cluster_upgrade_cp_nodes_raw
+  changed_when: false
+
+# Field names differ between the v1beta1 and v1beta2 Cluster API resources
+# (spec.rolloutStrategy, spec.strategy, then spec.rollout.strategy): both are
+# read. Cluster API defaults maxSurge to 1 when it is not set.
+- name: Register the control plane, the host inventories and the nodes
+  vars:
+    cluster_upgrade_kcp: >-
+      {{ (cluster_upgrade_capi_raw.results[0].stdout | from_json)['items']
+         | selectattr('metadata.name', 'equalto', cluster_upgrade_kcp_name) | first }}
+    cluster_upgrade_inventories: "{{ (cluster_upgrade_capi_raw.results[2].stdout | from_json)['items'] }}"
+  ansible.builtin.set_fact:
+    cluster_upgrade_kcp_replicas: "{{ cluster_upgrade_kcp.spec.replicas | int }}"
+    cluster_upgrade_kcp_version: "{{ cluster_upgrade_kcp.spec.version }}"
+    cluster_upgrade_kcp_surge: >-
+      {{ cluster_upgrade_kcp.spec.rolloutStrategy.rollingUpdate.maxSurge
+         | default(cluster_upgrade_kcp.spec.rollout.strategy.rollingUpdate.maxSurge | default(1)) | int }}
+    # PreprovisionedInventory name -> number of hosts it lists
+    cluster_upgrade_inventory_hosts: >-
+      {{ dict(cluster_upgrade_inventories | map(attribute='metadata.name')
+              | zip(cluster_upgrade_inventories | map(attribute='spec.hosts') | map('length'))) }}
+    # Ready node name -> kubelet release
+    cluster_upgrade_ready_nodes: >-
+      {{ dict(cluster_upgrade_nodes_raw.stdout_lines | select('match', '.* True$')
+              | map('regex_replace', ' True$', '') | map('split', ' ')) }}
+    cluster_upgrade_cp_nodes: "{{ cluster_upgrade_cp_nodes_raw.stdout_lines | map('regex_replace', '^node/', '') | list }}"
+
+# Done: the KubeadmControlPlane asks for the target release and each of its
+# replicas is a Ready node running it.
+- name: Set whether the control plane needs the upgrade
+  vars:
+    cluster_upgrade_cp_at_target: >-
+      {{ cluster_upgrade_cp_nodes | select('in', cluster_upgrade_ready_nodes) | map('extract', cluster_upgrade_ready_nodes)
+         | select('equalto', cluster_upgrade_kubernetes_version) | list }}
+  ansible.builtin.set_fact:
+    cluster_upgrade_controlplane_pending: >-
+      {{ cluster_upgrade_kcp_version != cluster_upgrade_kubernetes_version
+         or cluster_upgrade_cp_nodes | length != cluster_upgrade_kcp_replicas | int
+         or cluster_upgrade_cp_at_target | length != cluster_upgrade_kcp_replicas | int }}
+
+# One entry per MachineDeployment of the cluster. Done: the MachineDeployment
+# asks for the target release and each of its replicas is a machine at that
+# release whose node is Ready and runs it. A percentage maxSurge is rounded up,
+# as Cluster API does.
+- name: Register the node pools
+  vars:
+    cluster_upgrade_md_machines: >-
+      {{ cluster_upgrade_machines_raw.stdout_lines | select('match', '^' ~ (item.metadata.name | regex_escape) ~ ' ')
+         | map('split', ' ') | list }}
+    cluster_upgrade_md_nodes_at_target: >-
+      {{ cluster_upgrade_md_machines | selectattr('1', 'equalto', cluster_upgrade_kubernetes_version)
+         | map(attribute='2') | select('in', cluster_upgrade_ready_nodes) | map('extract', cluster_upgrade_ready_nodes)
+         | select('equalto', cluster_upgrade_kubernetes_version) | list }}
+    cluster_upgrade_md_surge_raw: >-
+      {{ item.spec.strategy.rollingUpdate.maxSurge
+         | default(item.spec.rollout.strategy.rollingUpdate.maxSurge | default(1)) | string }}
+    cluster_upgrade_md_surge: >-
+      {{ (((cluster_upgrade_md_surge_raw | regex_replace('%$', '') | int) * (item.spec.replicas | int) / 100)
+          | round(0, 'ceil') | int)
+         if cluster_upgrade_md_surge_raw is match('.*%$') else (cluster_upgrade_md_surge_raw | int) }}
+  ansible.builtin.set_fact:
+    cluster_upgrade_nodepools: >-
+      {{ cluster_upgrade_nodepools | default([]) + [{
+           'name': item.metadata.name,
+           'inventory': item.metadata.name,
+           'replicas': item.spec.replicas | int,
+           'version': item.spec.template.spec.version,
+           'surge': cluster_upgrade_md_surge | int,
+           'pending': item.spec.template.spec.version != cluster_upgrade_kubernetes_version
+                      or cluster_upgrade_md_machines | length != item.spec.replicas | int
+                      or cluster_upgrade_md_nodes_at_target | length != item.spec.replicas | int}] }}
+  loop: >-
+    {{ (cluster_upgrade_capi_raw.results[1].stdout | from_json)['items']
+       | selectattr('spec.clusterName', 'equalto', cluster_name) | list }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Verify the cluster has at least one node pool
+  ansible.builtin.assert:
+    that:
+      - cluster_upgrade_nodepools | default([]) | length > 0
+    fail_msg: >-
+      No MachineDeployment of cluster '{{ cluster_name }}' in namespace {{ cluster_upgrade_namespace }}
+      (kubectl get machinedeployments -A): nothing to upgrade the workers with.
+    quiet: true
+
+# Cluster API creates each replacement machine before it deletes the old one
+# when maxSurge is at least 1. On pre-provisioned infrastructure a new machine
+# needs a free host in the inventory of its pool, and the toolkit keeps exactly
+# one host per replica: without a spare host such a rollout would wait forever.
+# With maxSurge 0 the old machine goes first and its host is reused. The
+# inventories are those the toolkit creates: <cluster_name>-control-plane and
+# one per node pool, named like the MachineDeployment.
+- name: Verify each rollout has the hosts its strategy needs
+  ansible.builtin.assert:
+    that:
+      - (cluster_upgrade_inventory_hosts[item.inventory] | default(0) | int) >= (item.replicas | int) + (item.surge | int)
+    fail_msg: >-
+      {{ item.name }} has {{ item.replicas }} replica(s) and maxSurge {{ item.surge }}, so its rollout needs
+      {{ (item.replicas | int) + (item.surge | int) }} host(s) in PreprovisionedInventory {{ item.inventory }}, which
+      lists {{ cluster_upgrade_inventory_hosts[item.inventory] | default('no') }} host(s) (kubectl get
+      preprovisionedinventories -n {{ cluster_upgrade_namespace }}). Add a spare host to that inventory, or set
+      maxSurge to 0 on {{ item.kind }}, then run the upgrade again.
+    quiet: true
+  loop: >-
+    {{ ([{'name': cluster_upgrade_kcp_name, 'kind': 'the KubeadmControlPlane (3 or more replicas only)',
+          'inventory': cluster_name ~ '-control-plane',
+          'replicas': cluster_upgrade_kcp_replicas, 'surge': cluster_upgrade_kcp_surge}]
+        if cluster_upgrade_controlplane_pending | bool else [])
+       + (cluster_upgrade_nodepools | selectattr('pending')
+          | map('combine', {'kind': 'the MachineDeployment'}) | list) }}
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Report the upgrade plan
+  ansible.builtin.debug:
+    msg: >-
+      Cluster {{ cluster_name }} (namespace {{ cluster_upgrade_namespace }}): NKP {{ cluster_upgrade_source_version }}
+      -> {{ nkp_version }}, Kubernetes -> {{ cluster_upgrade_kubernetes_version }}.
+      Kommander: {{ 'upgrade' if cluster_upgrade_kommander_pending | bool else 'already at ' ~ nkp_version }}.
+      Control plane {{ cluster_upgrade_kcp_name }}: {{ cluster_upgrade_kcp_replicas }} replica(s) at
+      {{ cluster_upgrade_kcp_version }}, maxSurge {{ cluster_upgrade_kcp_surge }},
+      {{ 'upgrade' if cluster_upgrade_controlplane_pending | bool else 'done' }}.
+      {% for pool in cluster_upgrade_nodepools %}Node pool {{ pool.name }}: {{ pool.replicas }} replica(s) at
+      {{ pool.version }}, maxSurge {{ pool.surge }}, {{ 'upgrade' if pool.pending else 'done' }}. {% endfor %}

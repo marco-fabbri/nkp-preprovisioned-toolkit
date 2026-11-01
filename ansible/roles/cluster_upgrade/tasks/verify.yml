@@ -1,0 +1,64 @@
+---
+# Final state: Kommander at the target release, every node Ready at the target
+# Kubernetes release, HelmReleases Ready, Rook Ceph HEALTH_OK. Pods that cannot
+# pull their image are reported: on NKP 2.19 and later, images of
+# docker.io/nutanix that fail to pull point at missing or wrong Nutanix Docker
+# Hub credentials.
+
+- name: Read the Kommander release
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: kommander_version
+
+- name: Read the nodes
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'nodes', '-o', cluster_upgrade_verify_jsonpath] }}"
+  vars:
+    cluster_upgrade_verify_jsonpath: >-
+      jsonpath={range .items[*]}{.metadata.name}{" "}{.status.nodeInfo.kubeletVersion}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}
+  register: cluster_upgrade_verify_nodes
+  changed_when: false
+
+- name: Verify Kommander and every node run the target releases
+  vars:
+    cluster_upgrade_verify_bad_nodes: >-
+      {{ cluster_upgrade_verify_nodes.stdout_lines
+         | reject('equalto', '') | reject('match', '^[^ ]+ ' ~ (cluster_upgrade_kubernetes_version | regex_escape) ~ ' True$')
+         | list }}
+  ansible.builtin.assert:
+    that:
+      - common_kommander_version == nkp_version
+      - cluster_upgrade_verify_bad_nodes | length == 0
+    fail_msg: >-
+      Upgrade incomplete. Kommander: {{ common_kommander_version or 'not found' }} (expected {{ nkp_version }}).
+      Nodes not Ready at {{ cluster_upgrade_kubernetes_version }}:
+      {{ cluster_upgrade_verify_bad_nodes | join(', ') or 'none' }}. Run ./deploy.sh upgrade again once the
+      cause is fixed: completed steps are skipped.
+    success_msg: >-
+      Kommander {{ nkp_version }}; {{ cluster_upgrade_verify_nodes.stdout_lines | reject('equalto', '') | list | length }}
+      node(s) Ready at Kubernetes {{ cluster_upgrade_kubernetes_version }}.
+
+- name: Check the cluster health after the upgrade
+  ansible.builtin.include_tasks: health.yml
+  vars:
+    cluster_upgrade_health_stage: after the upgrade
+
+- name: Read the pods that cannot pull their image
+  ansible.builtin.command:
+    argv: "{{ cluster_upgrade_kubectl + ['get', 'pods', '-A', '-o', cluster_upgrade_verify_jsonpath] }}"
+  vars:
+    cluster_upgrade_verify_jsonpath: >-
+      jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{" "}{..state.waiting.reason}{"\n"}{end}
+  register: cluster_upgrade_verify_pods
+  changed_when: false
+
+- name: Report the pods that cannot pull their image
+  vars:
+    cluster_upgrade_verify_pull_errors: >-
+      {{ cluster_upgrade_verify_pods.stdout_lines | select('search', 'ImagePullBackOff|ErrImagePull')
+         | map('split', ' ') | map('first') | list }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('WARNING: pods that cannot pull their image: ' ~ (cluster_upgrade_verify_pull_errors | join(', '))
+          ~ '. Check kubectl describe pod; images of docker.io/nutanix need valid Nutanix Docker Hub credentials.')
+         if cluster_upgrade_verify_pull_errors | length > 0 else 'No pod is failing to pull its image.' }}

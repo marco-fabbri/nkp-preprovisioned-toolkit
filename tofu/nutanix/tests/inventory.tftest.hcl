@@ -85,7 +85,8 @@ variables {
 
 # Values measured on AHV (PC 7.6): the virtio NIC is eth0 on Rocky
 # GenericCloud (net.ifnames=0) and ens3 on Ubuntu; the SCSI disks are
-# pci-0000:00:04.0-scsi-0:0:<index>:0 on both.
+# pci-0000:00:04.0-scsi-0:0:<index>:0 on both (measured with indexes 1 to 5;
+# index 6, the fifth local volume, follows the same pattern).
 run "inventory_uses_the_measured_ahv_names_on_ubuntu" {
   command = plan
   assert {
@@ -93,8 +94,8 @@ run "inventory_uses_the_measured_ahv_names_on_ubuntu" {
     error_message = "Ubuntu on AHV: ens3 and the SCSI slot 1 path"
   }
   assert {
-    condition     = strcontains(output.ansible_inventory, "\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:2:0\",\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:3:0\",\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:4:0\",\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:5:0\"")
-    error_message = "local volumes must be SCSI slots 2 to 5"
+    condition     = strcontains(output.ansible_inventory, "\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:2:0\",\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:3:0\",\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:4:0\",\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:5:0\",\"/dev/disk/by-path/pci-0000:00:04.0-scsi-0:0:6:0\"")
+    error_message = "local volumes must be SCSI slots 2 to 6"
   }
 }
 
@@ -120,11 +121,11 @@ run "guest_nic_name_overrides_the_default" {
   }
 }
 
-run "worker_has_six_disks" {
+run "worker_has_seven_disks" {
   command = plan
   assert {
-    condition     = length(nutanix_virtual_machine_v2.worker[0].disks) == 6 && length(nutanix_virtual_machine_v2.jump_host.disks) == 1
-    error_message = "worker must have OS + Ceph + 4 volumes, jump host OS only"
+    condition     = length(nutanix_virtual_machine_v2.worker[0].disks) == 7 && length(nutanix_virtual_machine_v2.jump_host.disks) == 1
+    error_message = "worker must have OS + Ceph + 5 volumes, jump host OS only"
   }
 }
 

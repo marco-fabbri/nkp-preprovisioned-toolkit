@@ -4,7 +4,8 @@
 # ==============================================================================
 
 # Size thresholds the hosts are checked against: the general resource
-# requirements that the NKP 2.18 guide sets for Pro and Ultimate clusters.
+# requirements that the NKP guide (2.18 and 2.19) sets for Pro and Ultimate
+# clusters.
 # Pre-provisioned infrastructure requires an NKP Pro or Ultimate licence, so
 # these are the requirements that apply; the toolkit does not create or size
 # the machines, it only verifies them. A smaller lab may lower single values
@@ -28,6 +29,16 @@ preflight_worker_min_root_fs_gib: 105
 preflight_ceph_osd_min_gib: 40
 # Worker count of the guide table; fewer workers only produce a warning.
 preflight_recommended_workers: 4
+# Local volumes the platform applications claim on a new cluster (measured on
+# NKP 2.18.0 and 2.19.0 with the default applications). Fewer local volume
+# disks than this plus one spare per worker only produce a warning.
+preflight_platform_local_volumes: 15
+
+# Rocky Linux minor release listed by the pre-provisioned OS table of each NKP
+# release. Another 9.x minor only produces a warning.
+preflight_rocky_tested_minors:
+  "2.18": "9.7"
+  "2.19": "9.8"
 
 # false skips the existence, checksum and content checks of the NKP CLI bundle
 # on the control machine (set by verify_hosts.yml, which installs nothing).

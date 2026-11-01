@@ -1,7 +1,8 @@
 # Backlog
 
 Short roadmap for the NKP Preprovisioned Toolkit. Its scope is node preparation,
-cluster creation, Kommander installation, worker scaling and the CIS Level 1 aligned
+cluster creation, Kommander installation, upgrades to the next NKP release, worker
+scaling and the CIS Level 1 aligned
 baseline (subset of controls), plus optional OpenTofu modules that create the hosts
 with the expected layout.
 
@@ -33,6 +34,13 @@ The validation status of the current revision is stated in
   against the SHA-256 the portal publishes (`nkp_version`, `nkp_archive_sha256`),
   one directory per release on the jump host with `/usr/local/bin/nkp` pointing at
   the release in use, and `nkp version` checked against `nkp_version`.
+- NKP 2.19 (2.18 still supported): Nutanix Docker Hub credentials read from the
+  environment or `.env` and passed to the CLI, `kubectl` at the Kubernetes release of
+  `nkp_version`, Rocky Linux minor release warning.
+- Upgrade to the next NKP release (BL-20): `./deploy.sh upgrade` runs
+  `nkp upgrade kommander`, `nkp upgrade addons`, `nkp update controlplane` and
+  `nkp update nodepool` in the order of the guide, with health gates, a check of the
+  hosts each rollout needs, and steps skipped when already done.
 - Summary banner with the dashboard credentials as an opt-in
   (`kommander_deploy_banner_show_credentials`); by default it prints the
   `nkp get dashboard` command and the absolute path of the kubeconfig.
@@ -51,12 +59,11 @@ The validation status of the current revision is stated in
 | BL-14 | Automated rollback of a failed `add-worker` | Today the failure message prints the manual `kubectl` steps |
 | BL-17 | NKP installation on VMs created by `tofu/nutanix`, `tofu/esxi` and `tofu/vsphere` | Validated with `./deploy.sh tofu-verify` only |
 | BL-18 | Remove the directory shortcut data at `remove-worker` cleanup | With `local_volume_devices = []` the directories `/var/local-disks/volN` and their bind mounts are left on the host |
-| BL-20 | Upgrade to a later NKP release driven by the toolkit | An upgrade needs the CLI of the target release (set `nkp_version`: it is installed next to the current one), then `nkp upgrade kommander` and `nkp upgrade cluster` in the order of the guide; needs a lab with two releases |
 | BL-21 | Hypervisor-agnostic workload storage (opt-in) | A variable that makes an existing StorageClass (your CSI driver) the default after the installation; and, as the agnostic option, a second Rook Ceph cluster managed outside the NKP life cycle (BYOS, as the guide calls it) with the RBD CSI on the disks that today go to the local volume provisioner, or Longhorn. The Ceph that NKP installs cannot be used: the guide reserves it for the platform applications and Kommander deploys its operator with the CSI disabled |
 
 ## Out of scope
 
 - Provisioning of bare-metal servers, and of virtual machines on providers without a
   module under `tofu/`.
-- Air-gapped installation, cluster upgrades, control plane scaling.
+- Air-gapped installation, upgrades of workload clusters, control plane scaling.
 - Full CIS Benchmark coverage or certification.

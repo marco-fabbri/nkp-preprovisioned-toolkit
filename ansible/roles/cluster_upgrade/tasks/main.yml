@@ -1,0 +1,57 @@
+---
+# ==============================================================================
+# Role: cluster_upgrade - Upgrade a pre-provisioned NKP cluster to nkp_version
+# ==============================================================================
+# Requires the "common" role defaults and the CLI of the target release on the
+# jump host (role jump_host). Every step reads the cluster first and is skipped
+# when the cluster is already at the target, so a run that stopped half way can
+# simply be run again.
+
+- name: Read the cluster and validate the upgrade path
+  ansible.builtin.include_tasks: discover.yml
+
+- name: Check the cluster health before the upgrade
+  ansible.builtin.include_tasks: health.yml
+  vars:
+    cluster_upgrade_health_stage: before the upgrade
+
+- name: Stop after the plan (cluster_upgrade_plan_only)
+  when: cluster_upgrade_plan_only | bool
+  ansible.builtin.meta: end_play
+
+- name: Store the Nutanix Docker Hub credentials on the cluster
+  when: nutanix_registry_credentials_supported | bool
+  ansible.builtin.include_tasks: credentials.yml
+
+- name: Upgrade Kommander
+  when: cluster_upgrade_kommander_pending | bool
+  ansible.builtin.include_tasks: kommander.yml
+
+# The addons (CNI, CSI, cluster autoscaler, node feature discovery) follow
+# Kommander and precede the Kubernetes upgrade of the nodes.
+- name: Upgrade the cluster addons
+  when: cluster_upgrade_controlplane_pending | bool
+  ansible.builtin.include_tasks: addons.yml
+
+# The upgrade to NKP 2.19.0 gives the pre-provisioned provider an image builder
+# tag without entrypoint: new machines would never be prepared (see the task
+# file of role "common").
+- name: Check the image builder of the pre-provisioned provider
+  when: cluster_upgrade_controlplane_pending | bool
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: provisioner_image
+
+- name: Upgrade the control plane
+  when: cluster_upgrade_controlplane_pending | bool
+  ansible.builtin.include_tasks: controlplane.yml
+
+- name: Upgrade each node pool
+  ansible.builtin.include_tasks: nodepool.yml
+  loop: "{{ cluster_upgrade_nodepools }}"
+  loop_control:
+    loop_var: cluster_upgrade_pool
+    label: "{{ cluster_upgrade_pool.name }}"
+
+- name: Verify the upgraded cluster
+  ansible.builtin.include_tasks: verify.yml

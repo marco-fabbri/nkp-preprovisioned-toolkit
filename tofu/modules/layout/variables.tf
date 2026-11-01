@@ -15,7 +15,7 @@ variable "os_distribution" {
 variable "sizing_profile" {
   type        = string
   default     = "pro-ultimate"
-  description = "VM sizes and disk layout: pro-ultimate (Pro and Ultimate requirements of the NKP 2.18 guide, the sizes the Ansible preflight checks) or contract-test (tiny VMs for ./deploy.sh tofu-verify only, no NKP installation). deploy.sh passes tofu_sizing_profile from inventory.ini when set"
+  description = "VM sizes and disk layout: pro-ultimate (Pro and Ultimate requirements of the NKP guide, the sizes the Ansible preflight checks) or contract-test (tiny VMs for ./deploy.sh tofu-verify only, no NKP installation). deploy.sh passes tofu_sizing_profile from inventory.ini when set"
   validation {
     condition     = contains(["pro-ultimate", "contract-test"], var.sizing_profile)
     error_message = "sizing_profile must be pro-ultimate or contract-test."
@@ -115,5 +115,5 @@ variable "ceph_disk_size_gb" {
 variable "local_volume_size_gb" {
   type        = number
   default     = null
-  description = "Size in GB of each of the 4 local volume disks of every worker (disks 3 to 6). Default: 110 for pro-ultimate, 5 for contract-test. NKP needs more than 100 GiB: Prometheus claims exactly 100 GiB and the file system is a little smaller than the disk"
+  description = "Size in GB of each of the 5 local volume disks of every worker (disks 3 to 7). Default: 110 for pro-ultimate, 5 for contract-test. NKP needs more than 100 GiB: Prometheus claims exactly 100 GiB and the file system is a little smaller than the disk"
 }

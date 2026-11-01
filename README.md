@@ -2,14 +2,15 @@
 
 [![CI](https://github.com/marco-fabbri/nkp-preprovisioned-toolkit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/marco-fabbri/nkp-preprovisioned-toolkit/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![NKP 2.18](https://img.shields.io/badge/NKP-2.18-024DA1.svg)](#requirements)
+[![NKP 2.19 | 2.18](https://img.shields.io/badge/NKP-2.19%20%7C%202.18-024DA1.svg)](#requirements)
 [![OS: Rocky Linux 9 | Ubuntu 24.04](https://img.shields.io/badge/OS-Rocky%20Linux%209%20%7C%20Ubuntu%2024.04-informational.svg)](#os-profile)
 [![Ansible](https://img.shields.io/badge/Ansible-automation-EE0000.svg?logo=ansible&logoColor=white)](ansible/)
 [![OpenTofu](https://img.shields.io/badge/OpenTofu-%E2%89%A5%201.6-FFDA18.svg?logo=opentofu&logoColor=black)](tofu/README.md)
 
-Ansible and bash automation that installs **Nutanix Kubernetes Platform (NKP) 2.18**
-on **pre-provisioned** hosts: existing virtual machines or bare-metal servers, on any
-hypervisor, that you have already installed with Rocky Linux 9 or Ubuntu 24.04 LTS.
+Ansible and bash automation that installs **Nutanix Kubernetes Platform (NKP) 2.19**
+(or 2.18) on **pre-provisioned** hosts: existing virtual machines or bare-metal servers,
+on any hypervisor, that you have already installed with Rocky Linux 9 or Ubuntu 24.04
+LTS, and that **upgrades** a cluster it installed to the next NKP release.
 Optional **OpenTofu** modules can create those hosts for you on **Proxmox VE, Nutanix
 AHV, VMware ESXi or vSphere**, with the disk layout NKP expects (see
 [Provisioning the hosts with OpenTofu](#provisioning-the-hosts-with-opentofu-optional)).
@@ -23,7 +24,7 @@ AHV, VMware ESXi or vSphere**, with the disk layout NKP expects (see
 > the NKP CLI from the Nutanix Support Portal under your own entitlement, and you are
 > responsible for complying with the Nutanix licence terms.
 >
-> The toolkit installs the layout the NKP 2.18 guide prescribes for Pro and Ultimate
+> The toolkit installs the layout the NKP guide prescribes for Pro and Ultimate
 > clusters on pre-provisioned infrastructure. It has been validated so far in a lab on
 > virtual machines (see
 > [Known limitations / validation status](#known-limitations--validation-status)); a
@@ -43,13 +44,17 @@ AHV, VMware ESXi or vSphere**, with the disk layout NKP expects (see
 | 2.5 | `cis` | all | Only with a `-cis` profile: apply and audit the [CIS Level 1 aligned baseline](#cis-level-1-aligned-baseline) |
 | 3 | `cluster_deploy` | jump host | `nkp create cluster preprovisioned --self-managed` with kube-vip; kubeconfig fetched to the repository root |
 | 4 | `storage_network` | jump host, workers | MetalLB Layer 2 address pool; the Rook Ceph OSD device on each worker (raw disk or loop device) |
-| 5 | `kommander_deploy` | jump host | Generates `~/nkp/kommander.yaml` (Ceph in host storage mode), `nkp install kommander`, Cluster UUID and licence status, summary banner |
+| 5 | `kommander_deploy` | jump host | Generates `~/nkp/kommander.yaml` (Ceph in host storage mode), `nkp install kommander`, image builder tag (NKP 2.19.0), Cluster UUID and licence status, summary banner |
 
 Two gates stop the whole run when any host failed or was unreachable: one after
 Stage 0, before any host is changed, and one before Stage 3, so the cluster is never
 created with a host that failed its preparation or the CIS audit. Both run with every
 `--tags` selection. To work around a host that is down, leave it out explicitly with
 `--limit '!<host>'`.
+
+`./deploy.sh upgrade` runs `ansible/upgrade.yml`, which moves an existing cluster to
+the NKP release set in `nkp_version`, one minor release at a time (see
+[Upgrading to a later NKP release](#upgrading-to-a-later-nkp-release)).
 
 Day-2 commands add or remove a worker through Cluster API
 (see [Day-2: scaling workers](#day-2-scaling-workers)). The hosts themselves can
@@ -62,14 +67,14 @@ flowchart TD
     subgraph Controller [Control machine]
         CLI["./deploy.sh"]
         Inv["inventory.ini"]
-        Bin["downloads/nkp_v2.18.0_linux_amd64.tar.gz"]
+        Bin["downloads/nkp_v2.19.0_linux_amd64.tar.gz"]
         Tofu["tofu/&lt;provider&gt; (optional)"]
     end
 
     subgraph Hosts [Pre-provisioned hosts, one Layer 2 subnet]
         JH["Jump host 10.10.10.80<br/>Docker (KIND bootstrap), nkp, kubectl"]
         CP["Control plane 10.10.10.81-83<br/>kube-vip VIP 10.10.10.85:6443"]
-        W["Workers 10.10.10.86-87<br/>OS disk, Ceph OSD disk, 4 local volume disks"]
+        W["Workers 10.10.10.86-87<br/>OS disk, Ceph OSD disk, 5 local volume disks"]
         LB["MetalLB pool 10.10.10.90-99<br/>NKP dashboard"]
     end
 
@@ -87,10 +92,12 @@ flowchart TD
 ### Hosts
 
 All hosts run the same OS, x86_64: **Rocky Linux 9** or **Ubuntu 24.04 LTS**. The
-preflight stage rejects anything else.
+preflight stage rejects anything else. The pre-provisioned OS table of NKP 2.19 lists
+Rocky Linux 9.8 (NKP 2.18: 9.7); another Rocky Linux 9 minor release only produces a
+warning.
 
 You create and size the machines; the toolkit only verifies them, against the Pro and
-Ultimate requirements of the NKP 2.18 guide:
+Ultimate requirements of the NKP guide (the same in 2.18 and 2.19):
 
 | Role | Each host | Hosts |
 |---|---|---|
@@ -114,14 +121,31 @@ Ultimate requirements of the NKP 2.18 guide:
 
 #### Worker disks
 
-Each worker carries the disk layout of the NKP 2.18 guide; the toolkit never
+Each worker carries the disk layout of the NKP guide; the toolkit never
 partitions a disk.
 
 | Disk | Default device | Size | Purpose |
 |---|---|---|---|
 | OS | the disk holding `/` | about 80 GB | operating system |
 | Ceph OSD | `ceph_osd_device` = `sdb` | at least 40 GiB (50 GB suggested) | Rook Ceph in host storage mode, one OSD per worker; the NKP defaults expect four |
-| Local volumes | `local_volume_devices` = `sdc`, `sdd`, `sde`, `sdf` | more than 100 GiB each (`local_volume_min_gib`) | local volume provisioner (`localvolumeprovisioner` StorageClass), one volume per disk under `/mnt/disks/vol1..vol4`; Prometheus alone claims a 100 GiB volume |
+| Local volumes | `local_volume_devices` = `sdc`, `sdd`, `sde`, `sdf` | more than 100 GiB each (`local_volume_min_gib`) | local volume provisioner (`localvolumeprovisioner` StorageClass), one volume per disk under `/mnt/disks/vol1`, `vol2` and so on; Prometheus alone claims a 100 GiB volume |
+
+**How many local volume disks.** The NKP guide asks for at least four per worker.
+On a new cluster the platform applications claim 15 local volumes (NKP 2.18 and
+2.19), and some of them must run on distinct workers (the three Loki ingesters, the
+three Ceph monitors). The scheduler binds a volume for one pod at a time: with the
+16 volumes of four workers, a single spare, a Loki ingester of a new NKP 2.19
+cluster stayed pending in the lab, its volume on a worker that already ran another
+ingester. An application enabled later that claims a volume (OpenCost with an
+Ultimate licence, for example) finds none either. Give every worker a spare
+volume, that is five local volume disks each with four workers. The OpenTofu
+modules create five, and the preflight warns when the disks leave no spare volume
+per worker. A disk added to a running cluster is prepared by `./deploy.sh install
+--tags node_prep` once it is listed in `local_volume_devices`. A pod that is
+already pending keeps its claim bound to the volume of the wrong worker: after
+adding the disks, delete that PersistentVolumeClaim and the pod, and the
+StatefulSet creates both again on a free volume. The data of that volume is lost
+(none yet on a new cluster).
 
 **How to name the disks.** `ceph_osd_device` and each entry of
 `local_volume_devices` accept two forms, and must designate the same disk on
@@ -142,7 +166,7 @@ stay put:
 
 ```ini
 ceph_osd_device = /dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-ceph
-local_volume_devices = ["/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol1", "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol2", "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol3", "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol4"]
+local_volume_devices = ["/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol1", "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol2", "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol3", "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol4", "/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-vol5"]
 ```
 
 The defaults stay `sdb` and `sdc`..`sdf` for compatibility with existing
@@ -161,7 +185,12 @@ whatever its kernel name at a given boot, and it is mounted by file system UUID.
   initialised with `gdisk` or `parted` is refused by Ceph even when empty: clear it
   with `wipefs --all` or `sgdisk --zap-all`) and no file system. Preflight checks
   the disk, the size and the signatures on every worker; Stage 4 checks the
-  signature again against the cluster state. OSDs are placed on worker nodes only.
+  signature again against the cluster state, including the copies of the BlueStore
+  label that Ceph 19 keeps at 1, 10, 100 and 1000 GiB: Rook silently skips a disk
+  that carries one from a previous cluster, even when the start of the disk is
+  blank (a disk cleared with `wipefs` only, or a new virtual disk on blocks a
+  previous one used, as thin LVM without zeroing gives). OSDs are placed on worker
+  nodes only.
 - **Local volume disks.** A disk without a file system is formatted whole with
   `local_volume_fstype` (`xfs`) and mounted by UUID through `/etc/fstab`
   (`defaults,noatime,nofail`) at `local_volume_mount_prefix<N>`, N being its
@@ -208,7 +237,11 @@ whatever its kernel name at a given boot, and it is mounted by file system UUID.
   do. Change the addresses, or set `pod_cidr` / `service_cidr` **before** the cluster
   is created.
 - Internet access: the jump host downloads Docker CE and `kubectl`; the nodes pull
-  OS packages and container images. Air-gapped installation is not covered.
+  OS packages and container images, the NKP platform images from `docker.io/nutanix`
+  (NKP 2.19 and later: with the credentials of
+  [Nutanix Docker Hub credentials](#nutanix-docker-hub-credentials-nkp-219-and-later)).
+  The NKP documentation lists the domains a connected cluster must reach. Air-gapped
+  installation is not covered.
 - DNS servers that answer from the node subnet (`dns_servers` of the OpenTofu
   modules, or the resolvers of hosts you created yourself): package and image pulls
   need name resolution. A resolver listed but unreachable from that subnet only
@@ -219,7 +252,7 @@ whatever its kernel name at a given boot, and it is mounted by file system UUID.
 
 ### Host firewalls on cluster nodes
 
-The NKP 2.18 guide lists this among the prerequisites of pre-provisioned control
+The NKP guide lists this among the prerequisites of pre-provisioned control
 plane and worker machines: *"firewalld systemd service is disabled"* (stop and
 disable it if it is enabled). The guide does not mention UFW; the toolkit treats
 Ubuntu the same way, because the reason is the same (a host firewall filters the
@@ -257,8 +290,8 @@ traffic of the CNI and of kube-proxy).
 
 ### NKP CLI
 
-Download the NKP v2.18.0 CLI bundle for **Linux amd64**
-(`nkp_v2.18.0_linux_amd64.tar.gz`) from the Nutanix Support Portal and place it in
+Download the NKP v2.19.0 CLI bundle for **Linux amd64**
+(`nkp_v2.19.0_linux_amd64.tar.gz`) from the Nutanix Support Portal and place it in
 `downloads/` as it is, without extracting it (details in
 [downloads/README.md](downloads/README.md)). Set `nkp_version` and
 `nkp_archive_sha256` in the inventory: the preflight verifies the bundle against that
@@ -270,6 +303,31 @@ pointing at `nkp_version`, and checks that `nkp version` reports that release.
 The bundle is verified rather than the extracted executable because the portal
 publishes the checksum of the bundle, and because Nutanix has republished a release
 under the same version with a rebuilt executable.
+
+The `kubectl` client of the jump host follows `nkp_version`: the Kubernetes release
+that NKP release installs (v1.36.2 for 2.19, v1.35.2 for 2.18), as the guide asks.
+
+### Nutanix Docker Hub credentials (NKP 2.19 and later)
+
+From NKP 2.19 a connected cluster without a registry mirror, the only kind this
+toolkit installs, pulls its platform images from `docker.io/nutanix` with a Nutanix
+Docker Hub user name and access token. Generate them on the NKP downloads page of the
+Nutanix Support Portal (an organisation can hold at most two tokens: reuse one rather
+than creating one per cluster). The toolkit reads them from the environment of the
+control machine, never from the inventory:
+
+```bash
+# .env in the repository root (gitignored), read by deploy.sh
+NUTANIX_REGISTRY_USERNAME=<user name>
+NUTANIX_REGISTRY_PASSWORD=<access token>
+```
+
+`chmod 600 .env`. `deploy.sh` takes only these two keys from the file (it does not
+execute it), and a variable already exported in the shell wins. The preflight stops
+when either is missing and `nkp_version` is 2.19 or later; NKP 2.18 never gets them.
+`./deploy.sh install` passes them to `nkp create cluster`, `./deploy.sh upgrade` to
+`nkp update cluster nutanix-registry-credentials` when the cluster holds none yet
+(see [Security considerations](#security-considerations)).
 
 ## Provisioning the hosts with OpenTofu (optional)
 
@@ -310,7 +368,7 @@ The kernel names of these disks do not follow the slot order (see
 [Worker disks](#worker-disks)): the generated inventory names them by a stable
 link that reads the same on every worker. On Proxmox it is the serial the module
 sets (`/dev/disk/by-id/scsi-SQEMU_QEMU_HARDDISK_nkp-ceph`, `..._nkp-vol1` to
-`..._nkp-vol4`); AHV, ESXi and vSphere do not let a module choose a disk serial, so
+`..._nkp-vol5`); AHV, ESXi and vSphere do not let a module choose a disk serial, so
 their modules use the `/dev/disk/by-path` link of the SCSI slot. The values per provider
 are in [tofu/README.md](tofu/README.md#stable-disk-paths).
 
@@ -333,8 +391,8 @@ provider module with `tofu-verify`, which skips the size thresholds.
 
 | `sizing_profile` | Control plane | Worker | OS disk | Ceph disk | Local volumes | Jump host |
 |---|---|---|---|---|---|---|
-| `pro-ultimate` | 4 vCPU / 16384 MB | 8 vCPU / 32768 MB | 80 GB | 50 GB | 4 x 110 GB | 4 vCPU / 8192 MB / 50 GB |
-| `contract-test` | 2 vCPU / 2048 MB | 2 vCPU / 2048 MB | 20 GB | 5 GB | 4 x 5 GB | 2 vCPU / 2048 MB / 20 GB |
+| `pro-ultimate` | 4 vCPU / 16384 MB | 8 vCPU / 32768 MB | 80 GB | 50 GB | 5 x 110 GB | 4 vCPU / 8192 MB / 50 GB |
+| `contract-test` | 2 vCPU / 2048 MB | 2 vCPU / 2048 MB | 20 GB | 5 GB | 5 x 5 GB | 2 vCPU / 2048 MB / 20 GB |
 
 The guide lists 3 control plane nodes and 4 workers; the module creates one worker per
 address and never enforces the count. The local volume disks get 110 GB, the headroom
@@ -494,7 +552,7 @@ Preflight checks that every host really runs the declared distribution.
 | `control_plane_vip` | `10.10.10.85` | kube-vip address of the Kubernetes API |
 | `virtual_ip_interface` | `eth0` | Interface on the control plane nodes that carries the VIP |
 | `metallb_ip_range` | `10.10.10.90-10.10.10.99` | MetalLB Layer 2 pool |
-| `nkp_version` | `2.18.0` | NKP release of the CLI bundle; the jump host must report it in `nkp version` |
+| `nkp_version` | `2.19.0` | NKP release of the CLI bundle (2.18.x or 2.19.x); the jump host must report it in `nkp version`. For `./deploy.sh upgrade`, the release to upgrade to |
 | `nkp_archive_sha256` | see example | SHA-256 of the CLI bundle as published by the Nutanix Support Portal |
 
 ### Optional variables
@@ -508,7 +566,7 @@ Preflight checks that every host really runs the declared distribution.
 | `cis_firewalld_on_nodes`, `cis_ufw_on_nodes` | `false`, `false` | `-cis` profiles: install and enable firewalld (Rocky) / UFW (Ubuntu) on cluster nodes. Outside the vendor prerequisites, see [Host firewalls on cluster nodes](#host-firewalls-on-cluster-nodes) |
 | `pod_cidr` | `192.168.0.0/16` | Pod network, passed to `nkp create cluster`; trusted by the host firewall rules |
 | `service_cidr` | `10.96.0.0/12` | Service network, passed to `nkp create cluster` |
-| `kubectl_version` | `v1.35.2` | `kubectl` client installed on the jump host |
+| `kubectl_version` | Kubernetes release of `nkp_version` (`v1.36.2` for 2.19) | `kubectl` client installed on the jump host; set it by hand only for an NKP release the toolkit does not list in `nkp_kubernetes_versions` |
 | `cluster_ssh_user` | `ansible_user` | User that Cluster API uses to reach the nodes |
 | `cluster_ssh_key_path` | `/home/<ansible_user>/.ssh/id_rsa` | Key pair on the jump host used by Cluster API; created when missing, never overwritten. Literal absolute path. For a new installation a dedicated key such as `/home/<ansible_user>/.ssh/nkp_cluster_key` is recommended |
 | `nkp_user_home` | `/home/<ansible_user>` | Home directory of `ansible_user` |
@@ -516,6 +574,10 @@ Preflight checks that every host really runs the declared distribution.
 | `cluster_kubeconfig` | `<nkp_workdir>/<cluster_name>.conf` | Kubeconfig on the jump host |
 | `nkp_nodepool_name` | `md-0` | Worker node pool name (the one created by the NKP CLI; do not change) |
 | `cluster_deploy_create_timeout_minutes` | `150` | Time allowed to `nkp create cluster` (about 40 minutes on Ubuntu and more than 70 on Rocky in a lab) |
+| `cluster_upgrade_plan_only` | `false` | `./deploy.sh upgrade` only: `true` reads the cluster, prints what the upgrade would do and stops (the jump host still gets the CLI and `kubectl` of the target release) |
+| `cluster_upgrade_force` | `false` | `./deploy.sh upgrade` only: `true` proceeds when a HelmRelease is not Ready or Rook Ceph is not `HEALTH_OK` |
+| `cluster_upgrade_controlplane_timeout_minutes`, `cluster_upgrade_nodepool_timeout_minutes_per_worker` | `150`, `45` | `./deploy.sh upgrade` only: time allowed to the control plane rollout, and to each worker of a node pool |
+| `cluster_upgrade_rotate_registry_credentials` | `false` | `./deploy.sh upgrade` only: `true` writes the Nutanix Docker Hub credentials even when the cluster already holds some (rotation) |
 | `preflight_assume_existing_cluster` | `false` | Skip the "VIP unused" and "port 6443 free" checks |
 | `preflight_control_plane_min_vcpus`, `preflight_control_plane_min_mem_mb` | `4`, `15000` | Size thresholds of each control plane node (Pro and Ultimate requirements, see [Hosts](#hosts)); lower a single value knowingly for a smaller lab |
 | `preflight_worker_min_vcpus`, `preflight_worker_min_mem_mb` | `8`, `30000` | Size thresholds of each worker |
@@ -576,6 +638,12 @@ or `-e '{"kommander_deploy_installer_overrides": {"apps": {...}}}'` on the comma
 An override of `apps.rook-ceph-cluster.values` replaces the generated Ceph settings
 as a whole (it is one YAML string, not merged): include the host storage settings
 again if you override it.
+
+On NKP 2.19.0 Stage 5 then waits, up to 20 minutes, for the Kommander management
+plane to write the Cluster API stack and corrects the
+[image builder tag](#upgrading-to-a-later-nkp-release) it sets. When the wait
+times out the stage warns and goes on: run `./deploy.sh install --tags
+kommander_deploy` again once the installation has settled.
 
 ## Licensing
 
@@ -684,6 +752,91 @@ command printed in the banner. A slow start can make Flux mark a release as stal
 and stop retrying; `./deploy.sh install --tags kommander_deploy` resets such
 releases and prints the banner again. That run also regenerates `~/nkp/kommander.yaml`
 (see [Kommander installer configuration](#kommander-installer-configuration)).
+
+## Upgrading to a later NKP release
+
+`./deploy.sh upgrade` upgrades a cluster installed by the toolkit to the release set
+in `nkp_version`. NKP upgrades one minor release at a time (2.18.x to 2.19.x, or a
+patch release within the same minor release) and never goes back; the playbook
+refuses any other path before it changes anything.
+
+1. Download the CLI bundle of the target release into `downloads/` and set
+   `nkp_version` and `nkp_archive_sha256` to that release in `inventory.ini`.
+2. Upgrading to NKP 2.19 or later: provide the
+   [Nutanix Docker Hub credentials](#nutanix-docker-hub-credentials-nkp-219-and-later).
+   With four workers of four local volume disks, add a fifth disk to every worker
+   first ([How many local volume disks](#worker-disks)): `./deploy.sh tofu-plan` and
+   `tofu-apply` add it to VMs created by the OpenTofu modules, then list it in
+   `local_volume_devices` and run `./deploy.sh install --tags node_prep`.
+3. Optional: `./deploy.sh upgrade -e cluster_upgrade_plan_only=true` reads the cluster,
+   prints what the upgrade would do and stops.
+4. `./deploy.sh upgrade`.
+
+The playbook runs the preflight on every host and the gate, installs the CLI and
+`kubectl` of the target release on the jump host next to the previous ones, then
+follows the order of the NKP guide:
+
+| Step | What happens | Skipped when |
+|---|---|---|
+| Read the cluster | Release of Kommander, namespace of the Cluster API objects, control plane, node pools, their rollout strategy and the hosts of their inventories | never (read only) |
+| Health gate | Every node Ready and at least one node per control plane and node pool replica, every HelmRelease of namespace `kommander` Ready, Rook Ceph `HEALTH_OK` | never |
+| Registry credentials | `nkp update cluster nutanix-registry-credentials --all-namespaces` | NKP 2.18, or the cluster already holds them |
+| Kommander | `nkp upgrade kommander`: Kommander, the Cluster API components and the platform applications | Kommander already at `nkp_version` |
+| Cluster addons | `nkp upgrade addons preprovisioned` (CNI, CSI, cluster autoscaler, node feature discovery) | control plane already upgraded |
+| Image builder tag | NKP 2.19.0 only: corrects the image the pre-provisioned provider uses to prepare new machines (see below) | the tag is already right |
+| Control plane | `nkp update controlplane preprovisioned --kubernetes-version <target>`, then a wait until the `KubeadmControlPlane` reports every replica Ready and up to date (the CLI can return while the last new machine is still being prepared) | every control plane node Ready at the target |
+| Node pools | for each pool, the health gate, then `nkp update nodepool preprovisioned <pool> --kubernetes-version <target>` and the same wait on its `MachineDeployment` | every node of the pool Ready at the target |
+| Verify | Kommander at `nkp_version`, every node Ready at the target Kubernetes release, HelmReleases Ready, Ceph `HEALTH_OK`, pods that cannot pull their image | never |
+
+The target Kubernetes release is the one the target NKP release installs on a new
+cluster (v1.36.2 for 2.19). The summary banner of the installation follows.
+
+- **Run it again after a failure.** Every step reads the cluster first and is
+  skipped when already done: fix the cause and run `./deploy.sh upgrade` again. A
+  timeout of the CLI does not stop a Cluster API rollout, which goes on in the
+  cluster; running the upgrade again waits for it.
+- **Hosts for the rollout.** Cluster API replaces every node with a new machine at
+  the target release. With `maxSurge` 0 the old machine is deleted first and its host
+  is provisioned again; with `maxSurge` 1 or more the new machine needs a free host
+  in the `PreprovisionedInventory` of its pool, and the toolkit keeps exactly one host
+  per replica. The playbook checks this before any change and names the pool and the
+  inventory that lack a host. A control plane with a single node always needs a
+  spare host (NKP guide).
+- **Disruption.** Each worker is drained before it is replaced. The disruption
+  budgets of Rook Ceph hold the next drain until Ceph has recovered, and a
+  PodDisruptionBudget of your own that allows no disruption holds it forever: check
+  `kubectl get pdb -A` first. A pod on a local volume restarts only when its node
+  is back (Prometheus, for example). The Kubernetes API stays on the VIP while the
+  control plane nodes are replaced one by one.
+- **Not part of the upgrade.** The OS of the nodes is not touched (for example Rocky
+  Linux 9.7 to 9.8; the preflight warns). No backup is taken: the guide recommends a
+  Velero backup first, and by default Velero stores it on the Rook Ceph of the same
+  cluster. Workload clusters attached to the management cluster are not upgraded.
+- **`./deploy.sh install` does not upgrade.** On a cluster that runs another release
+  than `nkp_version` it stops at Stage 5, before Kommander is touched, and points to
+  `./deploy.sh upgrade`.
+- **NKP 2.19 after an upgrade.** Kubernetes Dashboard keeps running next to Headlamp,
+  which replaces it on new clusters; the NKP release notes recommend moving to
+  Headlamp.
+- **Image builder tag of NKP 2.19.0.** Cluster API prepares each new
+  pre-provisioned machine with a Job that runs
+  `docker.io/mesosphere/nkp-image-builder:<tag>`, where the tag is the
+  `--nib-version` argument of `cappp-controller-manager`. Only the tags ending in
+  `.cli` have the builder as entrypoint: NKP 2.18 sets `v2.18.0.cli`, and so does
+  the NKP 2.19.0 CLI when it creates a cluster, but the Kommander management plane
+  of 2.19.0 writes `v2.19.0` into the `CapiStack` object `capi-stack`, after
+  `nkp upgrade kommander` and a few minutes after `nkp install kommander`. Every
+  new machine then stays in `Provisioning` with the condition `NIBFailed`, and the
+  pod of its `<machine>-provision` Job reports
+  `exec: "create": executable file not found`. Seen in the lab on the first control
+  plane machine of the upgrade rollout, and on a new cluster, where nothing fails
+  until a machine is added or replaced; not listed in the NKP 2.19 release notes.
+  The playbook adds the `.cli` suffix in `capi-stack`, waits for the provider to
+  restart and deletes the Jobs that failed with the wrong image, which the provider
+  creates again: `./deploy.sh upgrade` before the control plane and before each
+  node pool, `./deploy.sh add-worker` before it scales a node pool, and
+  `./deploy.sh install` at the end of Stage 5. Only a 2.19 tag without the suffix
+  is changed.
 
 ## CIS Level 1 aligned baseline
 
@@ -882,8 +1035,15 @@ Read this before using the toolkit outside an isolated lab.
   = true` prints the dashboard username and password, which grant cluster-admin,
   in the Ansible output. Keep the default `false` wherever that output is logged,
   archived or shown on a shared screen.
+- **Nutanix Docker Hub token.** It grants pulls from the Nutanix organisation on
+  Docker Hub. Keep it in `.env` (`chmod 600`, gitignored) or in the environment. The
+  NKP CLI accepts it only as a command-line argument: the Ansible tasks that pass it
+  run with `no_log`, and their error messages mask it, but while `nkp create cluster`
+  or `nkp update cluster nutanix-registry-credentials` runs, other local users of the
+  jump host can read it in the process list. The cluster keeps it in the Secret
+  `<cluster_name>-dockerhub-nutanix-credentials`.
 - **Secrets on disk.** `inventory.ini` can hold the password:
-  keep it `chmod 600`. It is gitignored, like the fetched kubeconfig
+  keep it `chmod 600`. It is gitignored, like `.env`, the fetched kubeconfig
   (`<cluster_name>.conf`, cluster-admin), `licenses/`, key files and the OpenTofu
   `terraform.tfvars` and state files (`tofu/<provider>/`, which hold the hypervisor
   credentials). Check `git status` before committing.
@@ -897,9 +1057,10 @@ Read this before using the toolkit outside an isolated lab.
 ## Known limitations / validation status
 
 Every scenario below was run in a lab of virtual machines on VLAN-separated
-networks, with the NKP CLI 2.18.0, no licence activated and the host sizes of
-[Hosts](#hosts) unless stated otherwise. "Passed" means the command ended without
-a failed task and the checks listed in the row held.
+networks, with the NKP CLI 2.18.0 (2.19.0 where the row names it), no licence
+activated and the host sizes of [Hosts](#hosts) unless stated otherwise. "Passed"
+means the command ended without a failed task and the checks listed in the row
+held.
 
 | Scenario | Result |
 |---|---|
@@ -916,6 +1077,10 @@ a failed task and the checks listed in the row held.
 | Fresh installation from scratch of v1.0.1 on VMs rebuilt by `tofu/proxmox` (`pro-ultimate`, `ubuntu`, guide disk layout), no licence, 2026-10-13 | Passed in 48 min with no failed task. 38 of 38 HelmReleases Ready a few minutes after the banner (Ceph was still creating its monitors when it printed), Ceph `HEALTH_OK` with four OSDs, 15 of 15 PersistentVolumeClaims bound, default `Pro` licence reported |
 | Summary banner with `kommander_deploy_banner_show_credentials` set to `false` and to `true`, 2026-10-14 | Passed: `false` printed the `nkp get dashboard` command and the kubeconfig path; `true` printed the username and password, which appeared once in the Ansible output (the task that reads them runs with `no_log`). The fallback to the command when `nkp get dashboard` fails was checked on simulated results with ansible-core 2.21.4 and 2.21.5 |
 | `tofu/vsphere` contract test, vCenter 8.0 Update 3 (VCSA tiny) with one ESXi 8.0 Update 3 host, 2026-10-09 | Passed for Ubuntu 24.04 and Rocky Linux 9 (OVA built from the cloud image, content library clone, cidata ISO). Changing the OS rebuilt the image and the VMs; a plan right after an apply showed no changes |
+| `./deploy.sh upgrade` from NKP 2.18.0 to 2.19.0 of a cluster installed by v1.1.0 (`ubuntu`, guide disk layout with a fifth local volume disk per worker, three control plane nodes and four workers, `maxSurge` 0), 2026-11-01 | Passed in 2 h 05 min: Kommander 41 min, control plane 45 min, the four workers 32 min. Kommander 2.19.0, seven nodes Ready at Kubernetes v1.36.2, 49 HelmReleases Ready, Rook Ceph `HEALTH_OK` with four OSDs and its device filter kept, the 17 PersistentVolumeClaims still bound, no pod failing to pull its image, Cluster UUID unchanged, no copy of the Docker Hub token left on the jump host. Headlamp and `nkp-mcp-server` are not enabled on the upgraded cluster; Kubernetes Dashboard keeps running. The run found two defects, fixed since: the [image builder tag](#upgrading-to-a-later-nkp-release) stopped the first control plane machine (about 20 min of the 45, corrected by hand during the run; the playbook correction was then run on the upgraded cluster with the tag set back to `v2.19.0`), and `nkp update controlplane` returned while the last control plane machine was still being prepared (the wait added since was checked on simulated clusters, and its query on the NKP 2.19 cluster of the next row) |
+| Fresh installation of NKP 2.19.0 on VMs rebuilt by `tofu/proxmox` (`pro-ultimate`, `ubuntu`, guide disk layout with four local volume disks per worker), 2026-11-01 | Passed in 65 min with no failed task; the banner reported 40 of 41 applications ready. Seven nodes Ready at Kubernetes v1.36.2, Rook Ceph `HEALTH_OK` with four OSDs, Headlamp and `nkp-mcp-server` enabled, the Docker Hub credentials Secret present, default `Pro` licence reported. The run found two defects, fixed since: a Loki ingester stayed pending for want of a free local volume on a worker without another ingester ([How many local volume disks](#worker-disks)), and about six minutes after Stage 5 started the management plane set the [image builder tag](#upgrading-to-a-later-nkp-release) without entrypoint. On the same cluster `tofu-plan` and `tofu-apply` then added a fifth local volume disk to every worker in place (hot-plugged, no reboot), `--tags node_prep` prepared it, and once the claim of the ingester was deleted all 41 applications and 43 HelmReleases were Ready, with 15 PersistentVolumeClaims bound and five volumes free. `./deploy.sh install --tags kommander_deploy` corrected the tag to `v2.19.0.cli`, and the management plane had not changed it again 30 minutes later |
+| Day-2 cycle (`remove-worker` then `add-worker` of the same host) on that NKP 2.19.0 cluster, 2026-11-01 | Passed in 10 min. `add-worker` found the image builder tag already corrected; the Job that prepared the new machine ran `nkp-image-builder:v2.19.0.cli` and succeeded in 5 min; the worker was Ready at v1.36.2, held a new OSD and Ceph was back to `HEALTH_OK` 4 min later |
+| Fresh installation of NKP 2.19.0 with the released code on VMs rebuilt again by `tofu/proxmox` (five local volume disks per worker), 2026-11-01 | Passed in 64 min with no failed task. The management plane set the image builder tag without entrypoint six minutes after Stage 5 started, and Stage 5 corrected it to `v2.19.0.cli` without any intervention. Every PersistentVolumeClaim bound at the first attempt (15 bound, five volumes free), the three Loki ingesters on three workers. Rook created two OSDs of four: two of the new virtual disks sat on blocks of the previous lab (thin LVM without zeroing) and carried BlueStore label copies at 1 and 10 GiB, which the Stage 4 check did not read. Stage 4 now reads them and stops (checked on this cluster with its CephCluster hidden); once they were zeroed with the commands it prints, Rook added the two OSDs, Ceph was `HEALTH_OK` and all 43 HelmReleases were Ready, Headlamp and `nkp-mcp-server` included |
 
 Not verified: hosts below the Pro and Ultimate requirements (lowered `preflight_*`
 thresholds), `cis_firewalld_on_nodes` / `cis_ufw_on_nodes`, `--cleanup-only`, SSH
@@ -928,8 +1093,9 @@ Known limitations:
   lab defaults of [Security considerations](#security-considerations) (public
   installation password, SSH password authentication, no SSH host key checking) must
   be changed before production.
-- NKP 2.18.0, x86_64, Rocky Linux 9 and Ubuntu 24.04 LTS only. No air-gapped
-  installation, no cluster upgrade automation.
+- NKP 2.18 and 2.19, x86_64, Rocky Linux 9 and Ubuntu 24.04 LTS only. No
+  air-gapped installation and no registry mirror. The upgrade covers the management
+  cluster the toolkit installed, one minor release at a time.
 - One cluster per inventory. Control plane nodes cannot be added or removed.
 - The lab shortcuts (`ceph_osd_device = ""`, `local_volume_devices = []`) put Ceph
   on loop devices backed by sparse files and the local volumes on directories of the
@@ -937,8 +1103,8 @@ Known limitations:
   `HEALTH_WARN` for slow BlueStore operations on loop devices.
 - The default StorageClass `localvolumeprovisioner` hands out whole disks, one
   PersistentVolume per local volume disk, bound to its worker. In practice: a
-  PersistentVolumeClaim of any size takes a whole disk (four per worker by default,
-  some used by the platform applications), the pod using it can run only on that
+  PersistentVolumeClaim of any size takes a whole disk (five per worker with the OpenTofu
+  modules, 15 of them used by the platform applications), the pod using it can run only on that
   worker, nothing is replicated, resized or snapshotted by the storage, and
   `remove-worker` wipes the disks of that worker. Fast (local disks, no network),
   but a worker failure takes its volumes with it and the number of volumes is fixed:
@@ -970,7 +1136,7 @@ Planned work is tracked in [BACKLOG.md](BACKLOG.md).
 deploy.sh                 command wrapper
 inventory.example.ini     inventory template
 requirements.yml          Ansible collections
-ansible/                  site.yml, add_worker.yml, remove_worker.yml, verify_hosts.yml, roles/
+ansible/                  site.yml, upgrade.yml, add_worker.yml, remove_worker.yml, verify_hosts.yml, roles/
 cis/                      CIS Level 1 aligned baseline (playbooks, wrappers, README)
 scripts/                  add-node.sh, remove-node.sh (called by deploy.sh)
 tofu/                     optional OpenTofu provisioning modules (README, modules/layout,

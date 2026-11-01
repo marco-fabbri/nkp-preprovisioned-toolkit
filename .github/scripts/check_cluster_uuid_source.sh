@@ -5,7 +5,7 @@
 # issued for it is rejected with "License key is not valid for this cluster".
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-task=ansible/roles/kommander_deploy/tasks/main.yml
+task=ansible/roles/kommander_deploy/tasks/summary.yml
 grep -q 'clusters.cluster.x-k8s.io' "$task" || { echo "FAIL: $task must read the Cluster UUID from clusters.cluster.x-k8s.io"; exit 1; }
 if grep -n -E 'namespace[[:space:]]*$|^[[:space:]]*- kube-system[[:space:]]*$' "$task" | grep -q .; then
   echo "FAIL: $task still reads a namespace UID for the Cluster UUID"; exit 1

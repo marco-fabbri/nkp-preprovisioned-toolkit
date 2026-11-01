@@ -27,9 +27,9 @@ variable "ceph_osd_device" {
 
 variable "local_volume_devices" {
   type        = list(string)
-  description = "Stable paths of the 4 local volume disks, volume 1 to 4, the same on every worker"
+  description = "Stable paths of the 5 local volume disks, volume 1 to 5, the same on every worker"
   validation {
-    condition     = length(var.local_volume_devices) == 4
-    error_message = "local_volume_devices must list exactly 4 paths."
+    condition     = length(var.local_volume_devices) == 5
+    error_message = "local_volume_devices must list exactly 5 paths."
   }
 }

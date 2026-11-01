@@ -59,6 +59,7 @@ jobs:
         run: >-
           ansible-lint
           ansible/site.yml
+          ansible/upgrade.yml
           ansible/add_worker.yml
           ansible/remove_worker.yml
           ansible/verify_hosts.yml
@@ -69,6 +70,7 @@ jobs:
         run: |
           for playbook in \
             ansible/site.yml \
+            ansible/upgrade.yml \
             ansible/add_worker.yml \
             ansible/remove_worker.yml \
             ansible/verify_hosts.yml \

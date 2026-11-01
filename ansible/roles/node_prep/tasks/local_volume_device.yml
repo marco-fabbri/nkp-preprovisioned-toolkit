@@ -13,14 +13,26 @@
   changed_when: false
   failed_when: false
 
+# The disk is already mounted at its own mount point (facts of this play).
+- name: Check whether the local volume is already mounted at {{ node_prep_volume_path }}
+  ansible.builtin.set_fact:
+    node_prep_volume_own_mount: >-
+      {{ ansible_facts['mounts'] | selectattr('mount', 'equalto', node_prep_volume_path)
+         | selectattr('device', 'equalto', '/dev/' ~ node_prep_volume_device) | list | length > 0 }}
+
 # A whole disk without partition table, either blank or already carrying the
 # local volume file system, and mounted nowhere else than its own mount point.
 # The mount point itself must not be taken by another device (for example the
-# bind mount of the lab shortcut on a host that is switched to devices).
+# bind mount of the lab shortcut on a host that is switched to devices). On a
+# running cluster a pod using the volume gets a bind mount of it under
+# /var/lib/kubelet/pods/, which lsblk may report instead of the volume's own
+# mount point: that is the same disk doing its job, accepted while the disk is
+# also mounted at its own mount point.
 - name: Verify the device is a blank whole disk or carries the local volume file system, /dev/{{ node_prep_volume_device }}
   vars:
     node_prep_volume_info: >-
       {{ ((node_prep_volume_lsblk.stdout | default('') or '{}') | from_json).blockdevices | default([{}]) | first | default({}) }}
+    node_prep_volume_mountpoint: "{{ node_prep_volume_info.mountpoint | default('', true) }}"
     node_prep_volume_other_mounts: >-
       {{ ansible_facts['mounts'] | selectattr('mount', 'equalto', node_prep_volume_path)
          | map(attribute='device') | reject('equalto', '/dev/' ~ node_prep_volume_device) | list }}
@@ -31,7 +43,9 @@
       - node_prep_volume_info.children | default([]) | length == 0
       - node_prep_volume_info.pttype | default('', true) | length == 0
       - node_prep_volume_info.fstype | default('', true) in ['', local_volume_fstype]
-      - node_prep_volume_info.mountpoint | default('', true) in ['', node_prep_volume_path]
+      - >-
+        node_prep_volume_mountpoint in ['', node_prep_volume_path]
+        or (node_prep_volume_own_mount | bool and node_prep_volume_mountpoint is match('^/var/lib/kubelet/pods/'))
       - node_prep_volume_other_mounts | length == 0
     fail_msg: >-
       {{ node_prep_volume.value }} (/dev/{{ node_prep_volume_device }}) on {{ inventory_hostname }} cannot be used as local volume
@@ -66,7 +80,11 @@
       {{ inventory_hostname }}: the file system was not created.
     quiet: true
 
+# Only before the first mount: on a mounted volume the path is the root of the
+# volume's file system, whose owner and mode kubelet sets for the pods using it
+# (fsGroup), and resetting them would take the pods' write access away.
 - name: Create mount point {{ node_prep_volume_path }}
+  when: not (node_prep_volume_own_mount | bool)
   ansible.builtin.file:
     path: "{{ node_prep_volume_path }}"
     state: directory

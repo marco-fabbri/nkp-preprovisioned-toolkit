@@ -1,8 +1,8 @@
 # Provider independent layout: sizes, names, cloud-init documents and the
 # inventory snippet. No resources and no providers.
 
-# pro-ultimate follows the general resource requirements that the NKP 2.18
-# guide sets for Pro and Ultimate clusters, the licences pre-provisioned
+# pro-ultimate follows the general resource requirements that the NKP guide
+# (2.18 and 2.19) sets for Pro and Ultimate clusters, the licences pre-provisioned
 # infrastructure requires. The local volume disks get 110 GB because
 # Prometheus claims exactly 100 GiB and the file system is a little smaller
 # than the disk. contract-test is far below the NKP minimums: it only exists to
@@ -39,7 +39,13 @@ locals {
     ceph_disk_gb    = coalesce(var.ceph_disk_size_gb, local.profile.ceph_disk_gb)
     local_volume_gb = coalesce(var.local_volume_size_gb, local.profile.local_volume_gb)
   })
-  local_volume_count = 4
+  # The NKP guide asks for at least four local volumes per worker. With four
+  # workers that is 16 volumes, and the platform applications of a new cluster
+  # claim 15 of them (NKP 2.18 and 2.19). Some must run on distinct workers
+  # (Loki ingesters, Ceph monitors), so with a single spare volume the
+  # scheduler can leave one of them pending, and an application enabled later
+  # finds no volume. Five per worker leave a spare volume on every worker.
+  local_volume_count = 5
 
   os_family = var.os_distribution == "rocky9" ? "rocky" : "ubuntu"
   os_label  = var.os_distribution == "rocky9" ? "Rocky Linux 9" : "Ubuntu 24.04 LTS"

@@ -25,7 +25,8 @@ variables {
 
 # Values measured on ESXi 8.0U3e (free licence): vmxnet3 is ens192 on Ubuntu
 # and eth0 on Rocky GenericCloud (net.ifnames=0); the PVSCSI disks are
-# pci-0000:03:00.0-scsi-0:0:<unit>:0 on both.
+# pci-0000:03:00.0-scsi-0:0:<unit>:0 on both (measured with units 1 to 5; unit
+# 6, the fifth local volume, follows the same pattern).
 run "inventory_uses_the_measured_esxi_names_on_ubuntu" {
   command = plan
   assert {
@@ -33,8 +34,8 @@ run "inventory_uses_the_measured_esxi_names_on_ubuntu" {
     error_message = "Ubuntu on ESXi: ens192 and the SCSI unit 1 path"
   }
   assert {
-    condition     = strcontains(output.ansible_inventory, "\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:2:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:3:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:4:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:5:0\"")
-    error_message = "local volumes must be SCSI units 2 to 5"
+    condition     = strcontains(output.ansible_inventory, "\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:2:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:3:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:4:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:5:0\",\"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:6:0\"")
+    error_message = "local volumes must be SCSI units 2 to 6"
   }
 }
 
@@ -52,15 +53,15 @@ run "rocky_uses_eth0" {
 run "vmx_layout" {
   command = plan
   assert {
-    condition     = length(terraform_data.vm) == 3 && strcontains(terraform_data.vm["nkp-worker-01"].input.vmx, "scsi0:5.fileName = \"data5.vmdk\"") && !strcontains(terraform_data.vm["nkp-jump-host"].input.vmx, "scsi0:1.")
-    error_message = "worker: 6 disks; jump host: OS disk only"
+    condition     = length(terraform_data.vm) == 3 && strcontains(terraform_data.vm["nkp-worker-01"].input.vmx, "scsi0:6.fileName = \"data6.vmdk\"") && !strcontains(terraform_data.vm["nkp-worker-01"].input.vmx, "scsi0:7.") && !strcontains(terraform_data.vm["nkp-jump-host"].input.vmx, "scsi0:1.")
+    error_message = "worker: 7 disks (units 0..6, unit 7 is the controller); jump host: OS disk only"
   }
   assert {
     condition     = strcontains(terraform_data.vm["nkp-worker-01"].input.vmx, "scsi0.virtualDev = \"pvscsi\"") && strcontains(terraform_data.vm["nkp-worker-01"].input.vmx, "ethernet0.virtualDev = \"vmxnet3\"") && strcontains(terraform_data.vm["nkp-worker-01"].input.vmx, "ethernet0.networkName = \"VM Network\"")
     error_message = "PVSCSI, vmxnet3 and the port group are part of the contract"
   }
   assert {
-    condition     = terraform_data.vm["nkp-worker-01"].input.data_gb == "5 5 5 5 5" && terraform_data.vm["nkp-jump-host"].input.data_gb == "" && terraform_data.vm["nkp-worker-01"].input.os_gb == "20"
+    condition     = terraform_data.vm["nkp-worker-01"].input.data_gb == "5 5 5 5 5 5" && terraform_data.vm["nkp-jump-host"].input.data_gb == "" && terraform_data.vm["nkp-worker-01"].input.os_gb == "20"
     error_message = "contract-test disk sizes"
   }
 }

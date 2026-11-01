@@ -378,6 +378,15 @@
           {{ not (day2_already_joined | bool)
              and (day2_replicas | int) < ((day2_inventory_hosts + [worker_ip]) | unique | length) }}
 
+    # After an upgrade to NKP 2.19.0 the provider cannot prepare new machines
+    # until its image builder tag is corrected (task file of role "common").
+    # Also on a re-run, which retries a preparation that failed for that reason.
+    - name: Check the image builder of the pre-provisioned provider
+      when: not (day2_already_joined | bool)
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: provisioner_image
+
     # --current-replicas makes the scale fail instead of scaling twice if the pool changed meanwhile.
     - name: Scale the worker MachineDeployment by +1
       when: day2_scale_needed | bool

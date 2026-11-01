@@ -54,7 +54,7 @@ resource "proxmox_virtual_environment_vm" "worker" {
   }
 
   # Local volumes for the local static provisioner (local_volume_devices =
-  # the by-id links of nkp-vol1..nkp-vol4, volume N = serial nkp-volN): the
+  # the by-id links of nkp-vol1..nkp-vol5, volume N = serial nkp-volN): the
   # toolkit formats them whole and mounts them by UUID under /mnt/disks/.
   dynamic "disk" {
     for_each = range(local.local_volume_count)

@@ -93,6 +93,6 @@ variable "guest_ceph_device" {
 
 variable "guest_local_volume_devices" {
   type        = list(string)
-  default     = ["/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:2:0", "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:3:0", "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:4:0", "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:5:0"]
-  description = "Stable paths of the local volume disks (SCSI units 2 to 5) inside the workers, volume 1 to 4"
+  default     = ["/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:2:0", "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:3:0", "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:4:0", "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:5:0", "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:6:0"]
+  description = "Stable paths of the local volume disks (SCSI units 2 to 6) inside the workers, volume 1 to 5"
 }

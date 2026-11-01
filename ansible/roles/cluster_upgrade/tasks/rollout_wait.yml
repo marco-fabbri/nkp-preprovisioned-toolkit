@@ -1,0 +1,41 @@
+---
+# Wait until a KubeadmControlPlane or a MachineDeployment reports every replica
+# Ready and up to date: spec.replicas, status.replicas, status.readyReplicas
+# and status.upToDateReplicas (Cluster API v1beta2) all equal. "nkp update
+# controlplane / nodepool" can return before that.
+# Input: cluster_upgrade_rollout_resource, cluster_upgrade_rollout_name,
+# cluster_upgrade_rollout_minutes (how long to wait, polled every 30 seconds).
+
+- name: Wait for every replica to be Ready and up to date in {{ cluster_upgrade_rollout_name }}
+  ansible.builtin.command:
+    argv: >-
+      {{ cluster_upgrade_kubectl
+         + ['-n', cluster_upgrade_namespace, 'get', cluster_upgrade_rollout_resource, cluster_upgrade_rollout_name,
+            '-o', cluster_upgrade_rollout_jsonpath] }}
+  vars:
+    cluster_upgrade_rollout_jsonpath: >-
+      jsonpath={.spec.replicas}{" "}{.status.replicas}{" "}{.status.readyReplicas}{" "}{.status.upToDateReplicas}
+  register: cluster_upgrade_rollout_status
+  until:
+    - cluster_upgrade_rollout_status.rc == 0
+    - cluster_upgrade_rollout_status.stdout.split() | length == 4
+    - cluster_upgrade_rollout_status.stdout.split() | unique | length == 1
+  retries: "{{ cluster_upgrade_rollout_minutes | int * 2 }}"
+  delay: 30
+  changed_when: false
+  failed_when: false
+
+- name: Stop when the rollout is not complete in {{ cluster_upgrade_rollout_name }}
+  ansible.builtin.assert:
+    that:
+      - cluster_upgrade_rollout_status.rc == 0
+      - cluster_upgrade_rollout_status.stdout.split() | length == 4
+      - cluster_upgrade_rollout_status.stdout.split() | unique | length == 1
+    fail_msg: >-
+      After {{ cluster_upgrade_rollout_minutes }} minutes {{ cluster_upgrade_rollout_name }} reports
+      (replicas wanted, existing, Ready, up to date):
+      {{ cluster_upgrade_rollout_status.stdout | default('') or cluster_upgrade_rollout_status.stderr | default('no output') }}.
+      Check kubectl get machines -n {{ cluster_upgrade_namespace }} -o wide; a machine that stays in Provisioning
+      shows the reason in its conditions and in the pod of its "-provision" Job. Run ./deploy.sh upgrade again
+      once the cause is fixed.
+    quiet: true

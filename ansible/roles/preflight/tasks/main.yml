@@ -17,13 +17,58 @@
       - metallb_ip_range is defined
       - pod_cidr is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
       - service_cidr is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
-      - kubectl_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
     fail_msg: >-
       Invalid inventory. Required: exactly 1 host in [jump_host], 1, 3 or 5 hosts
       in [control_plane], at least 1 host in [workers]; variables ansible_user,
       cluster_name, control_plane_vip, virtual_ip_interface and metallb_ip_range;
-      pod_cidr and service_cidr in CIDR notation; kubectl_version like v1.35.2.
-      See inventory.example.ini.
+      pod_cidr and service_cidr in CIDR notation. See inventory.example.ini.
+    quiet: true
+
+# The name cannot change once the cluster exists. The NKP guide allows
+# lowercase letters, digits, '.' and '-'; Cluster API copies the name into the
+# label cluster.x-k8s.io/cluster-name of every object, and a label value holds
+# at most 63 characters.
+- name: Validate cluster_name
+  run_once: true
+  ansible.builtin.assert:
+    that:
+      - cluster_name is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+      - cluster_name | length <= 63
+    fail_msg: >-
+      cluster_name '{{ cluster_name }}' must be lowercase letters, digits, '.' and '-', start and end with a
+      letter or digit, and be at most 63 characters long.
+    quiet: true
+
+# kubectl_version follows nkp_version through nkp_kubernetes_versions (role
+# "common"); a release missing from that map needs kubectl_version set by hand.
+- name: Validate kubectl_version
+  run_once: true
+  ansible.builtin.assert:
+    that:
+      - kubectl_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+    fail_msg: >-
+      kubectl_version is '{{ kubectl_version }}'. It is derived from nkp_version for the releases in
+      nkp_kubernetes_versions ({{ nkp_kubernetes_versions.keys() | join(', ') }}); for NKP {{ nkp_version | default('?') }}
+      set kubectl_version (like v1.36.2, the Kubernetes release of that NKP release) in inventory.ini.
+    quiet: true
+
+# NKP 2.19 and later pull the platform images of a connected cluster without a
+# registry mirror (the only kind this toolkit installs) from docker.io/nutanix
+# with these credentials: without them the creation and the upgrade stop.
+- name: Validate the Nutanix Docker Hub credentials
+  run_once: true
+  when:
+    - preflight_check_nkp_cli | bool
+    - nutanix_registry_credentials_supported | bool
+  ansible.builtin.assert:
+    that:
+      - nutanix_registry_username | length > 0
+      - nutanix_registry_password | length > 0
+    fail_msg: >-
+      NKP {{ nkp_version }} needs the Nutanix Docker Hub credentials: set NUTANIX_REGISTRY_USERNAME and
+      NUTANIX_REGISTRY_PASSWORD in the environment of this computer, or in the .env file of the repository
+      root (gitignored, chmod 600), which deploy.sh reads. Generate the access token on the NKP downloads
+      page of the Nutanix Support Portal (at most two tokens per organisation). See README.md.
     quiet: true
 
 - name: Verify the local NKP CLI bundle and the control machine state
@@ -60,7 +105,7 @@
               - nkp_archive_sha256 is defined
               - nkp_archive_sha256 is match('^[0-9a-f]{64}$')
             fail_msg: >-
-              nkp_version (like 2.18.0) and nkp_archive_sha256 (64 hexadecimal characters, the
+              nkp_version (like 2.19.0) and nkp_archive_sha256 (64 hexadecimal characters, the
               SHA-256 the Nutanix Support Portal shows for the Linux amd64 bundle) are required
               in the inventory. See downloads/README.md.
             quiet: true
@@ -227,6 +272,20 @@
       Host {{ inventory_hostname }} verified for profile {{ os_profile }}
       ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }})
 
+# Warning only: Rocky publishes a minor release about every six months, and a
+# host already in service on another 9.x must not be refused.
+- name: Warn when Rocky Linux is not the minor release the NKP release lists
+  when:
+    - os_profile in ['rocky', 'rocky-cis']
+    - preflight_rocky_tested_minor | length > 0
+    - ansible_facts['distribution_version'] != preflight_rocky_tested_minor
+  vars:
+    preflight_rocky_tested_minor: "{{ preflight_rocky_tested_minors[nkp_minor] | default('') }}"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }} runs Rocky Linux {{ ansible_facts['distribution_version'] }}; the
+      pre-provisioned table of NKP {{ nkp_minor }} lists Rocky Linux {{ preflight_rocky_tested_minor }}.
+
 - name: Validate target node OS matches Ubuntu profile
   when: os_profile in ['ubuntu', 'ubuntu-cis']
   ansible.builtin.assert:
@@ -259,7 +318,29 @@
   ansible.builtin.debug:
     msg: >-
       WARNING: {{ groups['workers'] | length }} worker(s) in the inventory; the NKP guide lists
-      {{ preflight_recommended_workers }} for Pro and Ultimate clusters.
+      {{ preflight_recommended_workers }} for Pro and Ultimate clusters. Every worker carries one Rook Ceph OSD,
+      and the erasure-coded (3+1) object store of the default Rook Ceph configuration assumes 4 OSDs.
+
+# The guide asks for at least four local volumes per worker. On a new cluster
+# the platform applications claim 15 of them, and some must run on distinct
+# workers (Loki ingesters, Ceph monitors). The scheduler binds a volume for one
+# pod at a time, so without a spare volume per worker one of those pods can
+# stay pending. The lab shortcut offers ten volumes per worker.
+- name: Warn when the local volume disks leave no spare volume per worker
+  run_once: true
+  when:
+    - local_volume_devices | length > 0
+    - preflight_local_volume_total | int < preflight_platform_local_volumes | int + groups['workers'] | length
+  vars:
+    preflight_local_volume_total: "{{ local_volume_devices | length * groups['workers'] | length }}"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ local_volume_devices | length }} local volume disk(s) on each of the {{ groups['workers'] | length }}
+      worker(s), {{ preflight_local_volume_total }} local volumes in all. The platform applications of a new
+      cluster claim {{ preflight_platform_local_volumes }}, several of them on distinct workers (Loki ingesters,
+      Ceph monitors): without a spare volume per worker one of them can stay pending, and an application enabled
+      later finds no volume. Add a local volume disk to every worker (the OpenTofu modules create five) and list
+      it in local_volume_devices.
 
 - name: Warn that the size thresholds are skipped
   run_once: true

@@ -1,0 +1,82 @@
+---
+# ==============================================================================
+# Upgrade Playbook: Nutanix Kubernetes Platform (Preprovisioned)
+# ==============================================================================
+# Moves the cluster to the NKP release set in nkp_version (inventory.ini), one
+# minor release at a time: set nkp_version and nkp_archive_sha256 to the next
+# release, place its CLI bundle in downloads/, then run ./deploy.sh upgrade.
+# The jump host gets the CLI and kubectl of the target release; the cluster is
+# upgraded in the order of the NKP guide: Kommander (with the Cluster API
+# components and the platform applications), the cluster addons, the control
+# plane, then each node pool. The nodes are not prepared again: their OS
+# changes are not part of the upgrade.
+
+- name: Stage 0 - Preflight Verification & Health Checks
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - preflight
+    - always
+  roles:
+    - role: common
+    - role: preflight
+
+# Ansible only drops a failed host from the following plays. The gate stops the
+# whole run instead, after every host has reported its own failures.
+- name: Gate - stop when a host failed the preflight checks
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: true
+  tags:
+    - always
+  tasks:
+    - name: Verify that no host failed or was unreachable in an earlier stage
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | difference(ansible_play_hosts) | length == 0
+        fail_msg: >-
+          Stopping before the cluster is upgraded: these hosts failed or were unreachable in an earlier
+          stage: {{ ansible_play_hosts_all | difference(ansible_play_hosts) | join(', ') }}.
+          Fix them (see the errors above) and run the command again.
+        quiet: true
+
+- name: Stage 1 - Jump Host (NKP CLI and kubectl of the target release)
+  hosts: jump_host
+  become: true
+  gather_facts: true
+  tags:
+    - jump_host
+  roles:
+    - role: common
+    - role: jump_host
+
+- name: Stage U - Upgrade the cluster
+  hosts: jump_host
+  become: false
+  gather_facts: false
+  tags:
+    - cluster_upgrade
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  roles:
+    - role: common
+    - role: cluster_upgrade
+
+- name: Stage S - Summary of the cluster
+  hosts: jump_host
+  become: false
+  gather_facts: false
+  tags:
+    - summary
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  roles:
+    - role: common
+  tasks:
+    - name: Print the summary of the cluster
+      when: not (cluster_upgrade_plan_only | default(false) | bool)
+      ansible.builtin.include_role:
+        name: kommander_deploy
+        tasks_from: summary

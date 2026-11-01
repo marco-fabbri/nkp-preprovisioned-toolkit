@@ -3,7 +3,8 @@
 # host and check that they can be told apart. Included with
 #   ansible.builtin.include_role: {name: common, tasks_from: data_disks}
 # by preflight, node_prep, storage_network, remove_worker.yml and
-# verify_hosts.yml. Nothing else of role "common" runs tasks.
+# verify_hosts.yml. The other task files of role "common" are kommander_version.yml
+# and provisioner_image.yml.
 #
 # Each configured value is either a kernel name (sdb, probed as /dev/sdb) or an
 # absolute path (/dev/disk/by-id/..., /dev/disk/by-path/..., /dev/sdb). Kernel

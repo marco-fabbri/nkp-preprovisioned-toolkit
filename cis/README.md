@@ -71,7 +71,7 @@ hardening on the jump host while a cluster bootstrap is in progress.
 
 ### Host firewall on cluster nodes
 
-The NKP 2.18 guide lists, among the prerequisites of pre-provisioned control plane
+The NKP guide lists, among the prerequisites of pre-provisioned control plane
 and worker machines, *"firewalld systemd service is disabled"*. A CIS benchmark asks
 for the opposite. This baseline follows the platform vendor by default:
 

@@ -1,0 +1,54 @@
+---
+# Cluster API replaces the control plane machines one at a time with machines
+# at the target Kubernetes release. The command waits for the whole rollout;
+# when it times out, the rollout goes on in the cluster, and running the
+# upgrade again waits for it (same release, nothing new is started).
+
+- name: Upgrade the control plane
+  block:
+    - name: Run nkp update controlplane preprovisioned (Kubernetes {{ cluster_upgrade_kubernetes_version }})
+      ansible.builtin.command:
+        argv:
+          - "{{ cluster_upgrade_nkp }}"
+          - update
+          - controlplane
+          - preprovisioned
+          - --cluster-name
+          - "{{ cluster_name }}"
+          - --namespace
+          - "{{ cluster_upgrade_namespace }}"
+          - --kubernetes-version
+          - "{{ cluster_upgrade_kubernetes_version }}"
+          - --timeout
+          - "{{ cluster_upgrade_controlplane_timeout_minutes | int }}m"
+          - --kubeconfig
+          - "{{ cluster_kubeconfig }}"
+        chdir: "{{ nkp_workdir }}"
+      async: "{{ cluster_upgrade_controlplane_timeout_minutes | int * 60 + 600 }}"
+      poll: 30
+      register: cluster_upgrade_controlplane_run
+      changed_when: true
+  rescue:
+    - name: Report the control plane upgrade failure
+      ansible.builtin.fail:
+        msg: >-
+          'nkp update controlplane preprovisioned' failed (rc={{ ansible_failed_result.rc | default('n/a') }}):
+          {{ (ansible_failed_result.stderr_lines | default([ansible_failed_result.msg | default('no output')]))[-15:]
+             | join(' | ') }}.
+          The rollout may still be in progress: check kubectl get machines -n {{ cluster_upgrade_namespace }} -o wide,
+          then run ./deploy.sh upgrade again.
+
+# The CLI returns once every machine has the new specification, which can be
+# before the last new machine is prepared and Ready (seen in the lab: the node
+# pool rollout started with two control plane nodes out of three).
+- name: Wait for every control plane replica to be Ready and up to date
+  ansible.builtin.include_tasks: rollout_wait.yml
+  vars:
+    cluster_upgrade_rollout_resource: kubeadmcontrolplanes.controlplane.cluster.x-k8s.io
+    cluster_upgrade_rollout_name: "{{ cluster_upgrade_kcp_name }}"
+    cluster_upgrade_rollout_minutes: "{{ cluster_upgrade_controlplane_timeout_minutes }}"
+
+- name: Check the cluster health after the control plane upgrade
+  ansible.builtin.include_tasks: health.yml
+  vars:
+    cluster_upgrade_health_stage: after the control plane upgrade

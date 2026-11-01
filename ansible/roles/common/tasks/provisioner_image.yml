@@ -1,0 +1,174 @@
+---
+# Make sure Cluster API can prepare new pre-provisioned machines. Included with
+#   ansible.builtin.include_role: {name: common, tasks_from: provisioner_image}
+# from a play on the jump host, before every step that creates machines,
+# cluster_upgrade (control plane, each node pool) and add_worker, and after the
+# Kommander installation (kommander_deploy).
+#
+# The pre-provisioned provider (cappp-controller-manager, namespace
+# cappp-system) prepares every new machine with a Job that runs the NKP Image
+# Builder image docker.io/mesosphere/nkp-image-builder:<tag>, where <tag> is
+# its --nib-version argument. Only the ".cli" variant of the image has the
+# builder as entrypoint. NKP 2.18 sets v2.18.0.cli, and so does the NKP 2.19.0
+# CLI when it creates a cluster, but the Kommander management plane of 2.19.0
+# writes v2.19.0 into the CapiStack object capi-stack, after "nkp upgrade
+# kommander" and a few minutes after "nkp install kommander". The Job of every
+# new machine then fails to start ('exec: "create": executable file not found',
+# machine condition NIBFailed). This file adds the missing suffix in capi-stack,
+# waits for the provider to restart with it and deletes the Jobs that failed
+# with the image without entrypoint, which the provider then creates again.
+#
+# Only a 2.19 tag without the suffix is changed: when NKP sets the right tag,
+# or a later release names its images differently, nothing is changed.
+#
+# Output: fact common_provisioner_image_fixed, true when capi-stack was changed.
+
+- name: Read the Cluster API stack
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - --request-timeout=60s
+      - get
+      - capistacks.nkp.nutanix.com
+      - capi-stack
+      - --ignore-not-found
+      - -o
+      - json
+  become: false
+  register: common_capistack
+  changed_when: false
+
+# The patch of the provider named "preprovisioned" that sets --nib-version, its
+# JSON pointer in capi-stack and the tag it sets (empty strings when absent).
+- name: Find the image builder tag of the pre-provisioned provider
+  vars:
+    common_capistack_doc: "{{ common_capistack.stdout | trim | default('{}', true) | from_json }}"
+    common_capistack_providers: "{{ common_capistack_doc.spec.providers | default([]) }}"
+    common_capistack_names: "{{ common_capistack_providers | map(attribute='name') | list }}"
+    common_capistack_index: >-
+      {{ common_capistack_names.index('preprovisioned') if 'preprovisioned' in common_capistack_names else -1 }}
+    common_capistack_patches: >-
+      {{ (common_capistack_providers[common_capistack_index | int].patches | default([]) | map(attribute='patch') | list)
+         if common_capistack_index | int >= 0 else [] }}
+    common_capistack_nib_patches: "{{ common_capistack_patches | select('search', '--nib-version=') | list }}"
+  ansible.builtin.set_fact:
+    common_provisioner_nib_patch: "{{ common_capistack_nib_patches | first | default('') }}"
+    common_provisioner_nib_path: >-
+      {{ ('/spec/providers/' ~ common_capistack_index ~ '/patches/'
+          ~ common_capistack_patches.index(common_capistack_nib_patches | first) ~ '/patch')
+         if common_capistack_nib_patches | length > 0 else '' }}
+    common_provisioner_nib_tag: >-
+      {{ (common_capistack_nib_patches | first | regex_search('--nib-version=[^]", ]+') | regex_replace('^--nib-version=', ''))
+         if common_capistack_nib_patches | length > 0 else '' }}
+
+- name: Register whether the image builder tag lacks the .cli suffix
+  ansible.builtin.set_fact:
+    common_provisioner_image_fixed: "{{ common_provisioner_nib_tag is match('^v2[.]19[.][0-9]+$') }}"
+
+- name: Add the missing .cli suffix to the image builder tag
+  when: common_provisioner_image_fixed | bool
+  block:
+    - name: Add the .cli suffix to the image builder tag in capi-stack
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ cluster_kubeconfig }}"
+          - --request-timeout=60s
+          - patch
+          - capistacks.nkp.nutanix.com
+          - capi-stack
+          - --type=json
+          - -p
+          - "{{ common_provisioner_nib_jsonpatch | to_json }}"
+      vars:
+        common_provisioner_nib_jsonpatch:
+          # "test" makes the patch fail instead of overwriting a capi-stack changed since it was read.
+          - op: test
+            path: "{{ common_provisioner_nib_path }}"
+            value: "{{ common_provisioner_nib_patch }}"
+          - op: replace
+            path: "{{ common_provisioner_nib_path }}"
+            value: >-
+              {{ common_provisioner_nib_patch
+                 | replace('--nib-version=' ~ common_provisioner_nib_tag ~ '"',
+                           '--nib-version=' ~ common_provisioner_nib_tag ~ '.cli"') }}
+      become: false
+      changed_when: true
+
+    - name: Wait for the pre-provisioned provider to use the corrected image builder tag
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ cluster_kubeconfig }}"
+          - --request-timeout=60s
+          - -n
+          - cappp-system
+          - get
+          - deployment
+          - cappp-controller-manager
+          - -o
+          - jsonpath={.spec.template.spec.containers[0].args}
+      become: false
+      register: common_provisioner_args
+      until: ('--nib-version=' ~ common_provisioner_nib_tag ~ '.cli"') in common_provisioner_args.stdout
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Wait for the pre-provisioned provider to restart
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ cluster_kubeconfig }}"
+          - -n
+          - cappp-system
+          - rollout
+          - status
+          - deployment/cappp-controller-manager
+          - --timeout=300s
+      become: false
+      changed_when: false
+
+# Jobs that failed with the image without entrypoint stay failed: the provider
+# creates a deleted Job again, with the image of its current argument.
+- name: Read the machine preparation Jobs
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - --request-timeout=60s
+      - get
+      - jobs
+      - -A
+      - -o
+      - >-
+        jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.template.spec.containers[0].image}{" "}{.status.failed}{"\n"}{end}
+  become: false
+  register: common_provisioner_jobs
+  changed_when: false
+
+- name: Delete the machine preparation Jobs that failed with the image without entrypoint
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - --request-timeout=60s
+      - -n
+      - "{{ item.split(' ')[0] }}"
+      - delete
+      - job
+      - "{{ item.split(' ')[1] }}"
+      - --ignore-not-found
+  loop: >-
+    {{ common_provisioner_jobs.stdout_lines
+       | select('match', '^[^ ]+ [^ ]+ [^ ]*nkp-image-builder:v2[.]19[.][0-9]+ [1-9]')
+       | list }}
+  become: false
+  changed_when: true

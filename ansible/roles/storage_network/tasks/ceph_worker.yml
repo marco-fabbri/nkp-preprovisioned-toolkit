@@ -86,12 +86,43 @@
   changed_when: false
   failed_when: false
 
+# Ceph 19 also writes copies of the BlueStore label at 1, 10, 100 and 1000 GiB.
+# lsblk only reads the start of the disk, so a disk whose first label is gone
+# (wipefs, or a new virtual disk on blocks a previous lab used, as thin LVM
+# without zeroing gives) still carries copies that Rook reads: it then skips
+# the disk without any error. Seen in the lab, two OSDs of four were missing.
+# Prints the offset in GiB of every label found.
+- name: Read the BlueStore labels of the Ceph OSD device on {{ item }}
+  delegate_to: "{{ item }}"
+  become: true
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import os, sys
+        fd = os.open(sys.argv[1], os.O_RDONLY)
+        size = os.lseek(fd, 0, os.SEEK_END)
+        for gib in (0, 1, 10, 100, 1000):
+            if (gib << 30) + 4096 <= size:
+                os.lseek(fd, gib << 30, os.SEEK_SET)
+                if os.read(fd, 22) == b"bluestore block device":
+                    print(gib)
+      - "/dev/{{ storage_network_ceph_device }}"
+  register: storage_network_ceph_labels
+  changed_when: false
+  failed_when: false
+
 # One line (no partitions), no partition table, no mount point, and either no
 # signature or the one Ceph wrote itself on an earlier run of this cluster.
 - name: Assert the Ceph OSD device is a raw, unused device on {{ item }}
   vars:
     storage_network_lsblk_fields: "{{ (storage_network_ceph_lsblk.stdout_lines | default(['']) | first | default('')).split() }}"
     storage_network_ceph_signature: "{{ storage_network_lsblk_fields | length == 4 and storage_network_lsblk_fields[3] == 'ceph_bluestore' }}"
+    storage_network_ceph_label_gib: "{{ storage_network_ceph_labels.stdout_lines | default([]) }}"
+    storage_network_ceph_foreign: >-
+      {{ ((storage_network_ceph_signature | bool) or storage_network_ceph_label_gib | length > 0)
+         and not (storage_network_cephcluster_exists | bool) }}
     storage_network_cephcluster_exists: "{{ storage_network_cephcluster.stdout | default('') | trim | length > 0 }}"
     storage_network_ceph_label: >-
       {{ (ceph_osd_device ~ ' (/dev/' ~ storage_network_ceph_device ~ ')') if ceph_osd_device | length > 0
@@ -102,15 +133,18 @@
       - storage_network_ceph_lsblk.stdout_lines | length == 1
       - storage_network_lsblk_fields | length in [3, 4]
       - storage_network_lsblk_fields | length == 3 or storage_network_ceph_signature | bool
-      - storage_network_lsblk_fields | length == 3 or storage_network_cephcluster_exists | bool
+      - not (storage_network_ceph_foreign | bool)
       - storage_network_lsblk_fields[2] | int >= storage_network_ceph_min_bytes | int
     fail_msg: >-
-      {{ storage_network_ceph_label ~ ' on ' ~ item ~ ' carries a Ceph signature but this cluster has no '
-         ~ 'CephCluster yet: it belongs to a previous installation. Clear it by hand, then re-run. Raw disk: '
-         ~ 'wipefs --all /dev/' ~ storage_network_ceph_device ~ '. Loop device: systemctl disable --now attach-ceph-loop; '
-         ~ 'losetup -d /dev/' ~ storage_network_ceph_loop_name ~ '; rm ' ~ storage_network_ceph_image_path
+      {{ storage_network_ceph_label ~ ' on ' ~ item ~ ' carries a Ceph signature (BlueStore label at '
+         ~ (storage_network_ceph_label_gib | join(', ') or '0') ~ ' GiB) but this cluster has no '
+         ~ 'CephCluster yet: it belongs to a previous installation, and Rook would skip the disk. Clear it by hand, '
+         ~ 'then re-run. Raw disk: wipefs --all /dev/' ~ storage_network_ceph_device ~ ', then zero each label: for g in '
+         ~ (storage_network_ceph_label_gib | join(' ') or '0') ~ '; do dd if=/dev/zero of=/dev/' ~ storage_network_ceph_device
+         ~ ' bs=1M count=1 seek=$((g * 1024)) oflag=direct conv=notrunc; done. Loop device: systemctl disable --now '
+         ~ 'attach-ceph-loop; losetup -d /dev/' ~ storage_network_ceph_loop_name ~ '; rm ' ~ storage_network_ceph_image_path
          ~ '. In both cases also rm -rf /var/lib/rook.'
-         if (storage_network_ceph_signature | bool) and not (storage_network_cephcluster_exists | bool)
+         if storage_network_ceph_foreign | bool
          else storage_network_ceph_label ~ ' on ' ~ item ~ ' cannot be used as Ceph OSD device: it must exist, '
               ~ 'be at least ' ~ ((storage_network_ceph_min_bytes | int / 1073741824) | int) ~ ' GiB, and have no partitions, '
               ~ 'no partition table (wipefs --all or sgdisk --zap-all clears it), no file system and no mount point.' }}

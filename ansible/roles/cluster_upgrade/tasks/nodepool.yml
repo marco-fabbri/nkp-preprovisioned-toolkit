@@ -1,0 +1,65 @@
+---
+# One node pool (loop variable cluster_upgrade_pool, see discover.yml). Each
+# worker is drained and replaced in turn; the Rook Ceph disruption budgets hold
+# the drain of the next worker until Ceph has recovered. Rook Ceph must be
+# HEALTH_OK before the pool starts.
+
+- name: Upgrade node pool {{ cluster_upgrade_pool.name }}
+  when: cluster_upgrade_pool.pending | bool
+  block:
+    - name: Check the cluster health before node pool {{ cluster_upgrade_pool.name }}
+      ansible.builtin.include_tasks: health.yml
+      vars:
+        cluster_upgrade_health_stage: before node pool {{ cluster_upgrade_pool.name }}
+
+    - name: Check the image builder of the pre-provisioned provider
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: provisioner_image
+
+    - name: Upgrade the node pool
+      vars:
+        cluster_upgrade_nodepool_timeout: >-
+          {{ cluster_upgrade_nodepool_timeout_minutes_per_worker | int * ([cluster_upgrade_pool.replicas | int, 1] | max) }}
+      block:
+        - name: Run nkp update nodepool preprovisioned {{ cluster_upgrade_pool.name }}
+          ansible.builtin.command:
+            argv:
+              - "{{ cluster_upgrade_nkp }}"
+              - update
+              - nodepool
+              - preprovisioned
+              - "{{ cluster_upgrade_pool.name }}"
+              - --cluster-name
+              - "{{ cluster_name }}"
+              - --namespace
+              - "{{ cluster_upgrade_namespace }}"
+              - --kubernetes-version
+              - "{{ cluster_upgrade_kubernetes_version }}"
+              - --timeout
+              - "{{ cluster_upgrade_nodepool_timeout }}m"
+              - --kubeconfig
+              - "{{ cluster_kubeconfig }}"
+            chdir: "{{ nkp_workdir }}"
+          async: "{{ cluster_upgrade_nodepool_timeout | int * 60 + 600 }}"
+          poll: 30
+          changed_when: true
+      rescue:
+        - name: Report the node pool upgrade failure
+          ansible.builtin.fail:
+            msg: >-
+              'nkp update nodepool preprovisioned {{ cluster_upgrade_pool.name }}' failed
+              (rc={{ ansible_failed_result.rc | default('n/a') }}):
+              {{ (ansible_failed_result.stderr_lines | default([ansible_failed_result.msg | default('no output')]))[-15:]
+                 | join(' | ') }}.
+              The rollout may still be in progress, or held by a PodDisruptionBudget that allows no disruption:
+              check kubectl get machines -n {{ cluster_upgrade_namespace }} -o wide and kubectl get pdb -A, then run
+              ./deploy.sh upgrade again.
+
+    - name: Wait for every replica of the node pool to be Ready and up to date
+      ansible.builtin.include_tasks: rollout_wait.yml
+      vars:
+        cluster_upgrade_rollout_resource: machinedeployments.cluster.x-k8s.io
+        cluster_upgrade_rollout_name: "{{ cluster_upgrade_pool.name }}"
+        cluster_upgrade_rollout_minutes: >-
+          {{ cluster_upgrade_nodepool_timeout_minutes_per_worker | int * ([cluster_upgrade_pool.replicas | int, 1] | max) }}

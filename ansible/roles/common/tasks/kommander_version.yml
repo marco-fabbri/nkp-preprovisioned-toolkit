@@ -1,0 +1,43 @@
+---
+# Read the NKP release of the Kommander installed on the cluster: the chart
+# version of the "kommander" HelmRelease in namespace kommander. Included with
+#   ansible.builtin.include_role: {name: common, tasks_from: kommander_version}
+# from a play on the jump host, by kommander_deploy (which refuses to install
+# over another release) and cluster_upgrade.
+#
+# Output: fact common_kommander_version, the release without a leading "v"
+# ("2.18.0"), or an empty string when Kommander is not installed. The run stops
+# when the API server cannot be reached.
+
+- name: Read the Kommander HelmRelease
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig
+      - "{{ cluster_kubeconfig }}"
+      - --request-timeout=60s
+      - -n
+      - kommander
+      - get
+      - helmreleases.helm.toolkit.fluxcd.io
+      - kommander
+      - --ignore-not-found
+      - -o
+      - json
+  become: false
+  register: common_kommander_hr
+  changed_when: false
+
+# The version the chart was last installed or upgraded at (status.history,
+# newest first) is what runs on the cluster; spec.chart.spec.version is the
+# version requested, used before Flux records a history.
+- name: Register the Kommander release
+  vars:
+    common_kommander_hr_doc: "{{ common_kommander_hr.stdout | trim | default('{}', true) | from_json }}"
+    common_kommander_history: "{{ common_kommander_hr_doc.status.history | default([]) }}"
+  ansible.builtin.set_fact:
+    common_kommander_version: >-
+      {{ ((common_kommander_history | first).chartVersion | default('')
+          if common_kommander_history | length > 0
+          else common_kommander_hr_doc.spec.chart.spec.version | default(''))
+         | string | regex_replace('^v', '') }}
